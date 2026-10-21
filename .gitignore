@@ -1,0 +1,13 @@
+# Only encrypted model data is intended for this repository.
+*.glb
+*.gltf
+*.step
+*.stp
+*.sldprt
+*.sldasm
+*.xml
+*.key
+*.record.json
+private/
+inputs/
+spec.json
