@@ -1,9 +1,16 @@
 {
   "version": 1,
-  "packageId": "bc1b8bbc5cc46f786ea4f4fd2a2e87d2",
+  "packageId": "7ed44f0ec7128fbf1bddaf34b57d6b76",
   "catalog": {
-    "path": "data/3ae9a9f2d53037cd220f61ad3f15c773a2fbe74c8238f77b44224faede85b63a.enc",
-    "bytes": 619,
-    "sha256": "3ae9a9f2d53037cd220f61ad3f15c773a2fbe74c8238f77b44224faede85b63a"
+    "path": "data/d5a0774571f3237516511f358cb3832f56dc767588c846debb23bf6db2f36fab.enc",
+    "bytes": 1728,
+    "sha256": "d5a0774571f3237516511f358cb3832f56dc767588c846debb23bf6db2f36fab"
+  },
+  "passwordUnlock": {
+    "version": 1,
+    "kdf": "PBKDF2-SHA256",
+    "iterations": 600000,
+    "salt": "z9J-ILAyOEALCcYQw-IHFw",
+    "wrappedKey": "UlBWMZUVdHwbHwhC2Bgz-Ayt1BnqygG3BJdkisMcrg5xuZiQgEFvnZxY_PadwOJ8YJpUHoTxFTITaAZnjAJfCw"
   }
 }

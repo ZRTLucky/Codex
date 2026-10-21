@@ -1,7 +1,9 @@
+import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs';
 const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer');
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
 const cache=new Map(),encoder=new TextEncoder();
-let motionFrame=0;
+let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0;
+const pageIdentity=new URL('.',location.href).href,lockFlag='cad-preview-locked:'+pageIdentity;
 function stopMotion(){cancelAnimationFrame(motionFrame);motionFrame=0;viewer.pause?.();$('#motion-play').textContent='往返播放';}
 function seekMotion(time){
   // This installed viewer resets mixer time when seeking a stopped action.
@@ -11,18 +13,26 @@ function seekMotion(time){
 function showMotionProgress(){
   const fraction=viewer.duration>0?Math.max(0,Math.min(1,viewer.currentTime/viewer.duration)):0;
   $('#motion-progress').value=String(Math.round(fraction*1000));
-  const motion=catalog?.models[active]?.motion;
-  if(motion){
+  const motion=motionConfig;
+  if(motion?.samples){
     const angle=fraction*motion.angleMaxDeg,rows=motion.samples;let i=0;while(i+1<rows.length-1&&angle>rows[i+1].angleDeg)i++;
     const a=rows[i],b=rows[i+1],f=Math.max(0,Math.min(1,(angle-a.angleDeg)/(b.angleDeg-a.angleDeg)));
     const lift=a.pinionLiftMm+(b.pinionLiftMm-a.pinionLiftMm)*f;
-    $('#motion-status').textContent='离合座顺时针 '+angle.toFixed(1)+'° · 小齿抬起 '+lift.toFixed(3)+' mm';
+    $('#motion-status').textContent=(motion.driveLabel||'驱动角度')+' '+angle.toFixed(1)+'° · '+(motion.drivenLabel||'联动位移')+' '+lift.toFixed(3)+' mm';
   }else $('#motion-status').textContent='进度 '+(fraction*100).toFixed(0)+'%';
+}
+async function selectMotion(index){
+  const run=epoch,request=selection,motionRequest=++motionSequence,entry=catalog.models[active],names=viewer.availableAnimations;
+  stopMotion();const name=names[index];motionConfig=entry.motions?.find(m=>m.animationName===name)||(index===0?entry.motion:null);
+  viewer.animationCrossfadeDuration=0;viewer.animationName=name;await viewer.updateComplete;if(run!==epoch||request!==selection||motionRequest!==motionSequence)return;seekMotion(0);
+  for(const [i,b]of [...$('#motion-modes').children].entries())b.classList.toggle('active',i===index);
+  $('#motion-low').textContent=motionConfig?.startLabel||'起点';$('#motion-high').textContent=motionConfig?.endLabel||'终点';$('label[for="motion-progress"]').textContent=motionConfig?.progressLabel||'运动进度';showMotionProgress();
 }
 function configureMotion(){
   stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=!available.length;if(!available.length)return;
-  viewer.animationCrossfadeDuration=0;viewer.animationName=available[0];seekMotion(0);
-  const hasLift=Boolean(catalog?.models[active]?.motion);$('#motion-low').textContent=hasLift?'下降':'起点';$('#motion-high').textContent=hasLift?'抬起':'终点';showMotionProgress();
+  $('#motion-modes').replaceChildren();$('#motion-modes').hidden=available.length<2;
+  for(const [i,name]of available.entries()){const b=document.createElement('button');b.type='button';b.textContent=catalog.models[active].motions?.find(m=>m.animationName===name)?.label||name;b.onclick=()=>selectMotion(i);$('#motion-modes').append(b);}
+  return selectMotion(0);
 }
 function moveTo(fraction){
   if(!viewer.duration)return;stopMotion();const start=viewer.currentTime,target=Math.min(Math.max(0,viewer.duration-1e-6),viewer.duration*fraction),began=performance.now(),run=epoch;
@@ -61,19 +71,24 @@ function prepareViewer(){
 }
 function clearState(){
   stopMotion();$('#motion').hidden=true;
-  epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;
+  epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
   $('#models').replaceChildren();$('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
 }
 async function selectModel(index){
+  if(index===loadingIndex)return;
+  if(index===active&&document.documentElement.dataset.loaded===String(index)&&viewer.src===cache.get(index)){
+    $('#motion').hidden=!(viewer.availableAnimations?.length);tell(catalog.models[index].label+'已加载，可旋转查看');return;
+  }
   const run=epoch,request=++selection,entry=catalog.models[index],k=key,parent=base,signal=controller.signal;active=index;
+  loadingIndex=index;
   stopMotion();$('#motion').hidden=true;viewer.removeAttribute('src');
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
   for(const [i,button]of [...$('#models').children].entries())button.classList.toggle('active',i===index);
   tell('正在加载'+entry.label+'…');
   try{
-    await prepareViewer();if(run!==epoch||request!==selection)return;
+    await prepareViewer();await viewer.updateComplete;if(run!==epoch||request!==selection)return;
     let objectUrl=cache.get(index);
     if(!objectUrl){
       const data=await decrypt(entry,entry.aad,k,parent,signal,n=>{if(run===epoch&&request===selection)tell('正在下载'+entry.label+'：'+(n/1048576).toFixed(2)+' MB');});
@@ -83,19 +98,15 @@ async function selectModel(index){
       objectUrl=URL.createObjectURL(new Blob([data],{type:'model/gltf-binary'}));cache.set(index,objectUrl);
     }
     if(run!==epoch||request!==selection)return;tell('解密完成，正在显示'+entry.label+'…');viewer.src=objectUrl;
-  }catch(e){if(run===epoch&&request===selection){tell(e.name==='OperationError'?'模型解密失败，文件可能已损坏或密钥不匹配':e.message,true);document.documentElement.dataset.error='true';}}
+  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;tell(e.name==='OperationError'?'模型解密失败，文件可能已损坏或密钥不匹配':e.message,true);document.documentElement.dataset.error='true';}}
 }
-$('#unlock-form').addEventListener('submit',async e=>{
-  e.preventDefault();if($('#unlock').disabled)return;
-  const value=$('#access-key').value.trim();$('#access-key').value='';
-  if(!/^RP1\.[A-Za-z0-9_-]{43}$/.test(value)){tell('请输入完整的 RP1. 访问密钥',true);return;}
-  if(!globalThis.isSecureContext||!crypto.subtle){tell('请通过 HTTPS 或本机 localhost 打开预览',true);return;}
-  clearState();const run=epoch;controller=new AbortController();const signal=controller.signal;$('#unlock').disabled=true;tell('正在验证访问密钥…');
-  try{
-    const raw=Uint8Array.from(atob(value.slice(4).replace(/-/g,'+').replace(/_/g,'/')+'='),c=>c.charCodeAt(0));assert(raw.length===32);
-    const candidate=await crypto.subtle.importKey('raw',raw,{name:'AES-GCM'},false,['decrypt']);raw.fill(0);
-    const source=await json(new URL('./source.json',location.href),4096,signal),manifestUrl=urlAt(source.manifest,location.href);
-    const manifest=await json(manifestUrl,16384,signal);assert(manifest.version===1&&/^[a-f0-9]{32}$/.test(manifest.packageId));
+async function getPackage(){
+    const source=await json(new URL('./source.json',location.href),4096),manifestUrl=urlAt(source.manifest,location.href);
+    const manifest=await json(manifestUrl,16384);assert(manifest.version===1&&/^[a-f0-9]{32}$/.test(manifest.packageId));
+    return {manifest,manifestUrl,scope:manifestUrl.href+'#'+manifest.packageId};
+}
+async function openPackage(candidate,pkg,run,save){
+    const {manifest,manifestUrl}=pkg,signal=controller.signal;
     const plain=await decrypt(manifest.catalog,'rp1:'+manifest.packageId+':catalog',candidate,manifestUrl,signal);
     const unlocked=JSON.parse(new TextDecoder().decode(plain));
     assert(unlocked.version===1&&unlocked.packageId===manifest.packageId&&typeof unlocked.title==='string'&&typeof unlocked.note==='string'&&Array.isArray(unlocked.models)&&unlocked.models.length>0&&unlocked.models.length<=20);
@@ -103,11 +114,25 @@ $('#unlock-form').addEventListener('submit',async e=>{
     if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;
     $('#title').textContent=catalog.title;$('#note').textContent=catalog.note;
     for(const [i,m]of catalog.models.entries()){const button=document.createElement('button');button.type='button';button.textContent=m.label;button.addEventListener('click',()=>selectModel(i));$('#models').append(button);}
-    $('#gate').hidden=true;$('#preview').hidden=false;await selectModel(0);
-  }catch(e){if(run===epoch){clearState();tell(e.name==='OperationError'?'访问密钥不正确，或预览包已被修改':e.message,true);document.documentElement.dataset.error='true';}}
+    $('#gate').hidden=true;$('#preview').hidden=false;
+    if(save)try{await rememberKey(pkg.scope,pageIdentity,candidate);$('#forget-device').hidden=false;$('#device-status').textContent='已记住此设备；下次打开本页会自动解锁。';}catch{$('#device-status').textContent='此浏览器无法保存登录，本次仍可正常预览。';}
+    try{sessionStorage.removeItem(lockFlag);}catch{}
+    if(run===epoch)await selectModel(0);
+}
+async function unlock(value,save,fromDevice=false){
+  if(!globalThis.isSecureContext||!crypto.subtle){tell('请通过 HTTPS 或本机 localhost 打开预览',true);return;}
+  clearState();const run=epoch;controller=new AbortController();$('#unlock').disabled=true;tell(fromDevice?'正在使用此设备的登录记录…':'正在验证访问密码…');
+  try{const pkg=await getPackage(),candidate=fromDevice?value:await importAccessKey(value,pkg.manifest);await openPackage(candidate,pkg,run,save);}
+  catch(e){if(run===epoch){clearState();tell(e.name==='OperationError'?'访问密码或密钥不正确，或预览包已被修改':e.message,true);document.documentElement.dataset.error='true';}}
   finally{$('#unlock').disabled=false;}
+}
+$('#unlock-form').addEventListener('submit',async e=>{
+  e.preventDefault();if($('#unlock').disabled)return;const value=$('#access-key').value;$('#access-key').value='';if(!value)return;await unlock(value,$('#remember-device').checked);
 });
-$('#lock').addEventListener('click',()=>{clearState();tell('预览已锁定');$('#access-key').focus();});
+$('#lock').addEventListener('click',()=>{try{sessionStorage.setItem(lockFlag,'1');}catch{}clearState();tell('预览已锁定');$('#access-key').focus();});
+$('#forget-device').addEventListener('click',async()=>{
+  $('#forget-device').disabled=true;try{await forgetPageKeys(pageIdentity);try{sessionStorage.setItem(lockFlag,'1');}catch{}clearState();$('#remember-device').checked=false;$('#forget-device').hidden=true;$('#device-status').textContent='';tell('已忘记此设备，下次需要重新输入访问密码。');}catch(e){tell(e.message,true);}finally{$('#forget-device').disabled=false;}
+});
 $('#reset').addEventListener('click',()=>{viewer.cameraOrbit='35deg 65deg auto';viewer.cameraTarget='auto auto auto';viewer.jumpCameraToGoal();});
 $('#motion-low').addEventListener('click',()=>moveTo(0));$('#motion-high').addEventListener('click',()=>moveTo(1));
 $('#motion-progress').addEventListener('input',()=>{stopMotion();seekMotion(Math.min(Math.max(0,viewer.duration-1e-6),viewer.duration*Number($('#motion-progress').value)/1000));showMotionProgress();});
@@ -115,6 +140,12 @@ $('#motion-play').addEventListener('click',()=>{
   if(!viewer.paused){stopMotion();return;}stopMotion();viewer.play({repetitions:Infinity,pingpong:true});$('#motion-play').textContent='暂停';
   const run=epoch,frame=()=>{if(run!==epoch)return;showMotionProgress();if(!viewer.paused)motionFrame=requestAnimationFrame(frame);};motionFrame=requestAnimationFrame(frame);
 });
-viewer.addEventListener('load',()=>{if(catalog&&cache.get(active)===viewer.src){configureMotion();tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);}});
-viewer.addEventListener('error',()=>{if(catalog){tell('模型显示失败，点击模型按钮可重试',true);document.documentElement.dataset.error='true';}});
+viewer.addEventListener('load',async()=>{const run=epoch,request=selection;if(catalog&&cache.get(active)===viewer.src){await configureMotion();if(run!==epoch||request!==selection||!catalog)return;loadingIndex=-1;tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);}});
+viewer.addEventListener('error',()=>{if(catalog){loadingIndex=-1;tell('模型显示失败，点击模型按钮可重试',true);document.documentElement.dataset.error='true';}});
 window.addEventListener('pagehide',clearState);
+async function restoreDevice(){
+  $('#unlock').disabled=true;
+  try{const pkg=await getPackage(),saved=await rememberedKey(pkg.scope);if(saved){$('#forget-device').hidden=false;$('#remember-device').checked=true;$('#device-status').textContent='此设备已保存登录记录。';let locked=false;try{locked=sessionStorage.getItem(lockFlag)==='1';}catch{}if(!locked)await unlock(saved,false,true);}}
+  catch{}finally{$('#unlock').disabled=false;document.documentElement.dataset.authReady='true';}
+}
+restoreDevice();

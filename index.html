@@ -15,21 +15,24 @@
 <header><span class="eyebrow">私密模型 · 浏览器解密</span><h1 id="title">模型预览</h1><p id="note">输入单独收到的访问密钥，解锁本次预览。</p></header>
 <section id="gate" aria-label="解锁预览">
 <form id="unlock-form" autocomplete="off">
-<label for="access-key">访问密钥</label>
-<div class="unlock-row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="粘贴 RP1. 开头的访问密钥" required><button id="unlock" type="submit">解锁预览</button></div>
+<label for="access-key">访问密码或密钥</label>
+<div class="unlock-row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="输入访问密码，或粘贴 RP1. 密钥" required><button id="unlock" type="submit">解锁预览</button></div>
+<label class="remember-choice"><input id="remember-device" type="checkbox">记住此设备，下次自动解锁</label>
 </form>
-<p class="hint">密钥只在此浏览器内用于解密，不随下载请求发送。</p>
+<p class="hint">密码只在浏览器内用于解密，不随下载请求发送。请仅在自己的设备上勾选记住。</p>
 </section>
 <section id="preview" hidden aria-label="模型查看器">
 <nav><div id="models" aria-label="模型切换"></div><div><button id="reset" type="button">恢复视角</button><button id="lock" type="button">锁定预览</button></div></nav>
 <div id="motion" hidden>
-<div class="motion-buttons"><button id="motion-low" type="button">下降</button><button id="motion-high" type="button">抬起</button><button id="motion-play" type="button">往返播放</button></div>
+<div id="motion-modes" class="motion-buttons" hidden></div>
+<div class="motion-buttons"><button id="motion-low" type="button">起点</button><button id="motion-high" type="button">终点</button><button id="motion-play" type="button">往返播放</button></div>
 <label for="motion-progress">运动进度</label><input id="motion-progress" type="range" min="0" max="1000" step="1" value="0"><output id="motion-status" for="motion-progress">进度 0%</output>
 </div>
 <model-viewer id="viewer" camera-controls touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="三维模型预览"></model-viewer>
 <p class="hint">拖动旋转 · 双指缩放 / 平移</p>
 </section>
 <p id="status" role="status" aria-live="polite">等待输入访问密钥</p>
+<p id="device-status" class="hint"></p><button id="forget-device" type="button" hidden>忘记此设备</button>
 <footer>网格预览不用于精确测量。请仅向获准查看的人提供访问密钥。</footer>
 </main>
 </body>
