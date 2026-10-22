@@ -1,10 +1,11 @@
 {
   "version": 1,
-  "packageId": "f516ea71cc732d2fb6e0615355f95541",
+  "packageId": "57de59c26e5abb17f726bbfb2c5ddfe9",
   "files": [
     ".nojekyll",
     "index.html",
     "app.mjs",
+    "parts-controller.mjs",
     "device-auth.mjs",
     "style.css",
     "motion.css",
@@ -13,8 +14,7 @@
     "manifest.json",
     "model-viewer.min.js",
     "meshopt_decoder.js",
-    "data/61fc0bb3a881872c1e83c590816cb1cb06e8d983e40d48a2f9f4b41b6075166b.enc",
-    "data/a3b42f872ed71ed644af4e184c1ed10857fb4a6d6e6da006402fd0f161205f26.enc",
-    "data/dcaa051fd3b0797d56777a0c97fec6d963a93fd5e8b1392178b0a35cf69d1ea8.enc"
+    "data/2bda521f77176101e2cabecf3d56a563de93a3feb022ec253ad2703644d5d2dd.enc",
+    "data/66c5f33d53ea7a47f9d53ebaed0947592a27ffc1511adf9e1dbd50d025335a7f.enc"
   ]
 }
