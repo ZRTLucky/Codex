@@ -77,7 +77,7 @@ function clearState(){
   stopMotion();partsUI.reset(true);plainCache.clear();$('#motion').hidden=true;
   epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;mechanismId=null;pendingMechanism=null;motionEnabled=false;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
-  $('#models').replaceChildren();$('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
+  $('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
   $('#mechanisms').replaceChildren();for(const d of document.querySelectorAll('details'))d.open=false;
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
 }
@@ -88,10 +88,8 @@ async function selectModel(index){
   }
   const run=epoch,request=++selection,entry=catalog.models[index],k=key,parent=base,signal=controller.signal;active=index;
   loadingIndex=index;
-  $('#model-current').textContent=entry.label;
   stopMotion();partsUI.reset();$('#motion').hidden=true;viewer.removeAttribute('src');
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
-  for(const [i,button]of [...$('#models').children].entries())button.classList.toggle('active',i===index);
   tell('正在加载'+entry.label+'…');
   try{
     await prepareViewer();await viewer.updateComplete;if(run!==epoch||request!==selection)return;
@@ -119,7 +117,7 @@ async function openPackage(candidate,pkg,run,save){
     for(const [i,m]of unlocked.models.entries()){descriptor(m);assert(typeof m.label==='string'&&m.aad==='rp1:'+manifest.packageId+':model:'+i&&/^[a-f0-9]{64}$/.test(m.plainSha256)&&Number.isSafeInteger(m.plainBytes)&&m.plainBytes>=20&&m.plainBytes<=64*1024*1024);}
     if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;
     $('#title').textContent=catalog.title;$('#note').textContent=catalog.note;
-    for(const [i,m]of catalog.models.entries()){const button=document.createElement('button');button.type='button';button.textContent=m.label;button.dataset.model=String(i);button.addEventListener('click',async()=>{const same=active===i&&document.documentElement.dataset.loaded===String(i);pendingMechanism=null;mechanismId=null;motionEnabled=false;partsUI.setMotion(null);await selectModel(i);if(same)await applyMechanism(null);renderMechanisms();});$('#models').append(button);}renderMechanisms();
+    renderMechanisms();
     $('#gate').hidden=true;$('#preview').hidden=false;
     if(save)try{await rememberKey(pkg.scope,pageIdentity,candidate);$('#forget-device').hidden=false;$('#device-status').textContent='已记住此设备；下次打开本页会自动解锁。';}catch{$('#device-status').textContent='此浏览器无法保存登录，本次仍可正常预览。';}
     try{sessionStorage.removeItem(lockFlag);}catch{}
