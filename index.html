@@ -22,18 +22,19 @@
 <p class="hint">密码只在浏览器内用于解密，不随下载请求发送。请仅在自己的设备上勾选记住。</p>
 </section>
 <section id="preview" hidden aria-label="模型查看器">
-<nav><div id="models" aria-label="模型切换"></div><div><button id="reset" type="button">恢复视角</button><button id="lock" type="button">锁定预览</button></div></nav>
+<nav><details id="model-picker" class="picker"><summary>查看内容 <span id="model-current">请选择</span></summary><div id="models" class="choices" role="group" aria-label="模型切换"></div></details><div><button id="reset" type="button">恢复视角</button><button id="lock" type="button">锁定预览</button></div></nav>
+<details id="mechanism-picker" class="picker" hidden><summary>分类激活 <span id="mechanism-current">全部装配</span></summary><div id="mechanisms" class="choices" role="group" aria-label="分类激活"></div></details>
 <div id="view-modes" class="view-modes" role="group" aria-label="查看方式" hidden><button id="mode-assembly" type="button" class="active" aria-pressed="true">装配体</button><button id="mode-single" type="button" aria-pressed="false">独立零件</button></div>
-<div id="part-picker" hidden><label for="part-select">选择零件</label><select id="part-select"></select></div>
+<div id="part-picker" hidden><details id="part-choice" class="picker"><summary>选择零件 <span id="part-current">请选择</span></summary><div id="part-select" class="choices" role="group" aria-label="独立零件"></div></details><details id="relation-picker" class="picker"><summary>装配关系 <span id="relation-current">仅选中零件</span></summary><div id="relation-options" class="choices" role="group" aria-label="装配关系"></div></details></div>
 <model-viewer id="viewer" camera-controls touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="三维模型预览"></model-viewer>
 <model-viewer id="part-viewer" camera-controls touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="独立零件预览" hidden></model-viewer>
+<details id="display-picker" class="picker" hidden><summary>显示方式 <span id="display-current">装配</span></summary><div class="choices" role="group" aria-label="显示方式"><button type="button" data-presentation="assembly" aria-pressed="true">装配</button><button type="button" data-presentation="explode" aria-pressed="false">分解</button><button type="button" data-presentation="autoplay" aria-pressed="false">自动播放</button></div></details>
 <div id="motion" hidden>
-<div id="motion-modes" class="motion-buttons" hidden></div>
+<div id="motion-modes" hidden></div>
 <div class="motion-settings"><label for="motion-duration">单程时间</label><select id="motion-duration"><option value="1">1秒</option><option value="3" selected>3秒</option><option value="5">5秒</option></select></div>
-<div class="motion-buttons"><button id="motion-low" type="button">起点</button><button id="motion-high" type="button">终点</button><button id="motion-play" type="button">往返播放</button></div>
 <label for="motion-progress">运动进度</label><input id="motion-progress" type="range" min="0" max="1000" step="1" value="0"><output id="motion-status" for="motion-progress">进度 0%</output>
 </div>
-<details id="part-visibility" open hidden><summary>零件显隐 <span id="part-count"></span></summary><div id="part-list"></div></details>
+<details id="part-visibility" hidden><summary>零件显隐 <span id="part-count"></span></summary><div id="part-list"></div></details>
 <p class="hint">拖动旋转 · 双指缩放 / 平移</p>
 </section>
 <p id="status" role="status" aria-live="polite">等待输入访问密钥</p>

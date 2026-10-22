@@ -1,22 +1,25 @@
 import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs';
-import {createPartsController} from './parts-controller.mjs';
+import {createPartsController,EXPLODE} from './parts-controller.mjs';
 const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer');
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
 const cache=new Map(),plainCache=new Map(),encoder=new TextEncoder();
 let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0;
+let mechanismId=null,pendingMechanism=null,motionEnabled=false;
 const pageIdentity=new URL('.',location.href).href,lockFlag='cad-preview-locked:'+pageIdentity;
-const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),stopMotion,tell});
+const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),stopMotion,tell,onAutoPlay:playMotion,onChange:updateMotionUI});
 const travelSeconds=()=>Number($('#motion-duration').value)||3;
-function stopMotion(){cancelAnimationFrame(motionFrame);motionFrame=0;viewer.pause?.();$('#motion-play').textContent='往返播放';}
+function stopMotion(){cancelAnimationFrame(motionFrame);motionFrame=0;viewer.pause?.();$('#part-viewer').pause?.();$('#part-viewer').autoRotate=false;}
+function updateMotionUI(){const target=partsUI.activeViewer(),explodeAuto=partsUI.presentation()==='autoplay'&&target.animationName===EXPLODE;$('#motion').hidden=partsUI.presentation()==='explode'||(!motionEnabled&&!explodeAuto)||!target.duration;}
+function playMotion(){stopMotion();const target=partsUI.activeViewer();if(!target.duration)return;target.timeScale=target.duration/travelSeconds();target.play({repetitions:Infinity,pingpong:true});const run=epoch,frame=()=>{if(run!==epoch)return;showMotionProgress();if(!target.paused){if(target.animationName!==EXPLODE)partsUI.sync(target.currentTime);motionFrame=requestAnimationFrame(frame);}};motionFrame=requestAnimationFrame(frame);updateMotionUI();}
 function seekMotion(time){
   // This installed viewer resets mixer time when seeking a stopped action.
   // Activate the documented animation API before seeking, then hold the pose.
-  viewer.timeScale=1;viewer.play({repetitions:1,pingpong:false});viewer.currentTime=time;viewer.pause();
+  const target=partsUI.activeViewer();target.timeScale=1;target.play({repetitions:1,pingpong:false});target.currentTime=time;target.pause();if(target.animationName!==EXPLODE)partsUI.sync(time);
 }
 function showMotionProgress(){
-  const fraction=viewer.duration>0?Math.max(0,Math.min(1,viewer.currentTime/viewer.duration)):0;
+  const target=partsUI.activeViewer(),fraction=target.duration>0?Math.max(0,Math.min(1,target.currentTime/target.duration)):0;
   $('#motion-progress').value=String(Math.round(fraction*1000));
-  const motion=motionConfig;
+  const motion=motionEnabled&&target.animationName!==EXPLODE?motionConfig:null;
   if(motion?.samples){
     const angle=fraction*motion.angleMaxDeg,rows=motion.samples;let i=0;while(i+1<rows.length-1&&angle>rows[i+1].angleDeg)i++;
     const a=rows[i],b=rows[i+1],f=Math.max(0,Math.min(1,(angle-a.angleDeg)/(b.angleDeg-a.angleDeg)));
@@ -27,22 +30,18 @@ function showMotionProgress(){
 async function selectMotion(index){
   const run=epoch,request=selection,motionRequest=++motionSequence,entry=catalog.models[active],names=viewer.availableAnimations;
   stopMotion();const name=names[index];motionConfig=entry.motions?.find(m=>m.animationName===name)||(index===0?entry.motion:null);
-  viewer.animationCrossfadeDuration=0;viewer.animationName=name;await viewer.updateComplete;if(run!==epoch||request!==selection||motionRequest!==motionSequence)return;seekMotion(0);
+  viewer.animationCrossfadeDuration=0;viewer.animationName=name;await viewer.updateComplete;if(run!==epoch||request!==selection||motionRequest!==motionSequence)return;viewer.play({repetitions:1});viewer.currentTime=0;viewer.pause();partsUI.setMotion(motionEnabled?name:null);
   for(const [i,b]of [...$('#motion-modes').children].entries())b.classList.toggle('active',i===index);
-  $('#motion-low').textContent=motionConfig?.startLabel||'起点';$('#motion-high').textContent=motionConfig?.endLabel||'终点';$('label[for="motion-progress"]').textContent=motionConfig?.progressLabel||'运动进度';showMotionProgress();
+  $('label[for="motion-progress"]').textContent=motionConfig?.progressLabel||'运动进度';showMotionProgress();updateMotionUI();
 }
 function configureMotion(){
-  stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=!available.length;if(!available.length)return;
+  stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=true;if(!available.length){motionConfig=null;return;}
   $('#motion-modes').replaceChildren();$('#motion-modes').hidden=available.length<2;
   for(const [i,name]of available.entries()){const b=document.createElement('button');b.type='button';b.textContent=catalog.models[active].motions?.find(m=>m.animationName===name)?.label||name;b.onclick=()=>selectMotion(i);$('#motion-modes').append(b);}
   return selectMotion(0);
 }
-function moveTo(fraction){
-  if(!viewer.duration)return;stopMotion();const start=viewer.currentTime,target=Math.min(Math.max(0,viewer.duration-1e-6),viewer.duration*fraction),began=performance.now(),run=epoch;
-  const travelMs=Math.max(1,travelSeconds()*1000*Math.abs(target-start)/viewer.duration);
-  const frame=now=>{if(run!==epoch)return;const t=Math.min(1,(now-began)/travelMs);seekMotion(start+(target-start)*t);showMotionProgress();if(t<1)motionFrame=requestAnimationFrame(frame);};
-  motionFrame=requestAnimationFrame(frame);
-}
+function renderMechanisms(){const box=$('#mechanisms');box.replaceChildren();const groups=catalog?.ui?.mechanisms||[];$('#mechanism-picker').hidden=!groups.length;if(!groups.length)return;const all=document.createElement('button');all.type='button';all.textContent='全部装配';all.dataset.mechanism='all';all.setAttribute('aria-pressed',String(!mechanismId));all.onclick=()=>applyMechanism(null);box.append(all);for(const g of groups){const b=document.createElement('button');b.type='button';b.textContent=g.label;b.dataset.mechanism=g.id;b.disabled=g.enabled===false;b.setAttribute('aria-pressed',String(g.id===mechanismId));if(b.disabled){const hint=document.createElement('small');hint.textContent='待启用';b.append(hint);}b.onclick=async()=>{pendingMechanism=g;motionEnabled=false;stopMotion();if(active===g.modelIndex&&document.documentElement.dataset.loaded===String(active))await applyMechanism(g);else await selectModel(g.modelIndex);};box.append(b);}$('#mechanism-current').textContent=groups.find(g=>g.id===mechanismId)?.label||'全部装配';}
+async function applyMechanism(g){pendingMechanism=null;stopMotion();mechanismId=g?.id||null;motionEnabled=Boolean(g?.animationName&&viewer.availableAnimations.includes(g.animationName));partsUI.setScope(g?.partIds,g?.label);if(motionEnabled)await selectMotion(viewer.availableAnimations.indexOf(g.animationName));else partsUI.setMotion(null);renderMechanisms();updateMotionUI();if(g)tell(g.label+'已激活，可选择自动播放');}
 function tell(message,error=false){status.textContent=message;status.classList.toggle('error',error);}
 function assert(ok){if(!ok)throw Error('预览包格式或完整性不正确');}
 function urlAt(value,parent){
@@ -75,18 +74,20 @@ function prepareViewer(){
 }
 function clearState(){
   stopMotion();partsUI.reset(true);plainCache.clear();$('#motion').hidden=true;
-  epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
+  epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;mechanismId=null;pendingMechanism=null;motionEnabled=false;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
   $('#models').replaceChildren();$('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
+  $('#mechanisms').replaceChildren();for(const d of document.querySelectorAll('details'))d.open=false;
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
 }
 async function selectModel(index){
   if(index===loadingIndex)return;
   if(index===active&&document.documentElement.dataset.loaded===String(index)&&viewer.src===cache.get(index)){
-    $('#motion').hidden=partsUI.isSingle()||!(viewer.availableAnimations?.length);tell(catalog.models[index].label+'已加载，可旋转查看');return;
+    updateMotionUI();tell(catalog.models[index].label+'已加载，可旋转查看');return;
   }
   const run=epoch,request=++selection,entry=catalog.models[index],k=key,parent=base,signal=controller.signal;active=index;
   loadingIndex=index;
+  $('#model-current').textContent=entry.label;
   stopMotion();partsUI.reset();$('#motion').hidden=true;viewer.removeAttribute('src');
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
   for(const [i,button]of [...$('#models').children].entries())button.classList.toggle('active',i===index);
@@ -117,7 +118,7 @@ async function openPackage(candidate,pkg,run,save){
     for(const [i,m]of unlocked.models.entries()){descriptor(m);assert(typeof m.label==='string'&&m.aad==='rp1:'+manifest.packageId+':model:'+i&&/^[a-f0-9]{64}$/.test(m.plainSha256)&&Number.isSafeInteger(m.plainBytes)&&m.plainBytes>=20&&m.plainBytes<=64*1024*1024);}
     if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;
     $('#title').textContent=catalog.title;$('#note').textContent=catalog.note;
-    for(const [i,m]of catalog.models.entries()){const button=document.createElement('button');button.type='button';button.textContent=m.label;button.addEventListener('click',()=>selectModel(i));$('#models').append(button);}
+    for(const [i,m]of catalog.models.entries()){const button=document.createElement('button');button.type='button';button.textContent=m.label;button.dataset.model=String(i);button.addEventListener('click',async()=>{const same=active===i&&document.documentElement.dataset.loaded===String(i);pendingMechanism=null;mechanismId=null;motionEnabled=false;partsUI.setMotion(null);await selectModel(i);if(same)await applyMechanism(null);renderMechanisms();});$('#models').append(button);}renderMechanisms();
     $('#gate').hidden=true;$('#preview').hidden=false;
     if(save)try{await rememberKey(pkg.scope,pageIdentity,candidate);$('#forget-device').hidden=false;$('#device-status').textContent='已记住此设备；下次打开本页会自动解锁。';}catch{$('#device-status').textContent='此浏览器无法保存登录，本次仍可正常预览。';}
     try{sessionStorage.removeItem(lockFlag);}catch{}
@@ -137,15 +138,10 @@ $('#lock').addEventListener('click',()=>{try{sessionStorage.setItem(lockFlag,'1'
 $('#forget-device').addEventListener('click',async()=>{
   $('#forget-device').disabled=true;try{await forgetPageKeys(pageIdentity);try{sessionStorage.setItem(lockFlag,'1');}catch{}clearState();$('#remember-device').checked=false;$('#forget-device').hidden=true;$('#device-status').textContent='';tell('已忘记此设备，下次需要重新输入访问密码。');}catch(e){tell(e.message,true);}finally{$('#forget-device').disabled=false;}
 });
-$('#reset').addEventListener('click',()=>{const target=partsUI.activeViewer();target.cameraOrbit='35deg 65deg auto';target.cameraTarget='auto auto auto';target.jumpCameraToGoal();});
-$('#motion-low').addEventListener('click',()=>moveTo(0));$('#motion-high').addEventListener('click',()=>moveTo(1));
-$('#motion-progress').addEventListener('input',()=>{stopMotion();seekMotion(Math.min(Math.max(0,viewer.duration-1e-6),viewer.duration*Number($('#motion-progress').value)/1000));showMotionProgress();});
-$('#motion-play').addEventListener('click',()=>{
-  if(!viewer.paused){stopMotion();return;}stopMotion();viewer.timeScale=viewer.duration/travelSeconds();viewer.play({repetitions:Infinity,pingpong:true});$('#motion-play').textContent='暂停';
-  const run=epoch,frame=()=>{if(run!==epoch)return;showMotionProgress();if(!viewer.paused)motionFrame=requestAnimationFrame(frame);};motionFrame=requestAnimationFrame(frame);
-});
-$('#motion-duration').addEventListener('change',()=>{if(viewer.paused)stopMotion();viewer.timeScale=viewer.duration/travelSeconds();});
-viewer.addEventListener('load',async()=>{const run=epoch,request=selection;if(catalog&&cache.get(active)===viewer.src){await configureMotion();if(run!==epoch||request!==selection||!catalog)return;partsUI.configure(catalog.models[active],plainCache.get(active));loadingIndex=-1;tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);}});
+$('#reset').addEventListener('click',()=>partsUI.resetCamera());
+$('#motion-progress').addEventListener('input',()=>{stopMotion();const target=partsUI.activeViewer();seekMotion(Math.min(Math.max(0,target.duration-1e-6),target.duration*Number($('#motion-progress').value)/1000));showMotionProgress();});
+$('#motion-duration').addEventListener('change',()=>{const target=partsUI.activeViewer();target.timeScale=target.duration/travelSeconds();});
+viewer.addEventListener('load',async()=>{const run=epoch,request=selection;if(catalog&&cache.get(active)===viewer.src){partsUI.configure(catalog.models[active],plainCache.get(active));await configureMotion();if(run!==epoch||request!==selection||!catalog)return;await applyMechanism(pendingMechanism);loadingIndex=-1;tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);}});
 viewer.addEventListener('error',()=>{if(catalog){loadingIndex=-1;tell('模型显示失败，点击模型按钮可重试',true);document.documentElement.dataset.error='true';}});
 window.addEventListener('pagehide',clearState);
 async function restoreDevice(){
