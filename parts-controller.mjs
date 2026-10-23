@@ -38,7 +38,7 @@ export function createPartsController({viewer,partViewer,stopMotion,tell,onAutoP
  function renderChoices(){const box=$('#part-select');box.replaceChildren();if(!current)return;const available=current.parts.filter(p=>!scope||scope.has(p.id)),seen=new Set();
   for(const p of available){const b=button(p.label,p.id,selectedIds.has(p.id),()=>choosePart(p.id));b.dataset.part=p.id;box.append(b);}$('#part-current').textContent=selected()?.label||'请选择';$('#part-selection-count').textContent=selectedIds.size+' / '+available.length+' 已选';}
  async function animateSeparation(){
-  cancelAnimationFrame(separationFrame);const pose=++poseRun,start=separation,end=presentation==='explode'?1:0,run=request,ms=Math.max(1,(Number($('#assembly-duration').value)||3)*1000*Math.abs(end-start));
+  cancelAnimationFrame(separationFrame);const pose=++poseRun,start=separation,end=presentation==='explode'?1:0,run=request,ms=Math.max(1,(Number($('#assembly-duration').value)||1)*1000*Math.abs(end-start));
   // Freeze the user's current orbit and pan before changing clips. Pose actions
   // never reframe the camera; only the explicit restore-view button does so.
   const o=partViewer.getCameraOrbit(),t=partViewer.getCameraTarget();partViewer.cameraOrbit=o.theta+'rad '+o.phi+'rad '+o.radius+'m';partViewer.cameraTarget=t.x+'m '+t.y+'m '+t.z+'m';partViewer.fieldOfView=partViewer.getFieldOfView()+'deg';partViewer.jumpCameraToGoal();
