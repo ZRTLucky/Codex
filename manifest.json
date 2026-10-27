@@ -1,16 +1,16 @@
 {
   "version": 1,
-  "packageId": "29e67a527f82cb0297afa9fdf60c026a",
+  "packageId": "92a723616c91aebc5be88b1deba35ed8",
   "catalog": {
-    "path": "data/4eba1dd9ed268fb6a9b2ec9b9d3f8b8923aefb1168bd29743544f4f237a33558.enc",
+    "path": "data/7e80752e7162caf6c503be93b3a97883c8d7f429b3ea69664ec1511d85a631be.enc",
     "bytes": 14349,
-    "sha256": "4eba1dd9ed268fb6a9b2ec9b9d3f8b8923aefb1168bd29743544f4f237a33558"
+    "sha256": "7e80752e7162caf6c503be93b3a97883c8d7f429b3ea69664ec1511d85a631be"
   },
   "passwordUnlock": {
     "version": 1,
     "kdf": "PBKDF2-SHA256",
     "iterations": 600000,
-    "salt": "vhZRJkeJwOfSQDsiJsuBwg",
-    "wrappedKey": "UlBWMayUJyixEL0ka9Mf8B8tBthXAFXvoyTBmG_zq4E5Vidrb_2NeVvqIToILVcfdIhx7dsyeQ_6yLdD97pJUA"
+    "salt": "RF1UbRZwrQ61WtHja8zttw",
+    "wrappedKey": "UlBWMXYpa1Uqs97XQrQ4pSQBNftRaZGzoHi5qVbtz3U9VRe-AwzrHG2tL0T1KTStGDscGvdhQ03MKDmJFI2q7A"
   }
 }
