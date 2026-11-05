@@ -1,5 +1,111 @@
 import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs';
 import {createPartsController} from './parts-controller.mjs';
+// Shared by the generated STEP module, web controls and GLB animation compiler.
+// Absolute world transforms: rotate about the CAD datum, then translate.
+function createSequencePlayer(data) {
+  const fail = message => { throw Error('sequence: ' + message); };
+  const finite = n => typeof n === 'number' && Number.isFinite(n);
+  const vec = (v, label) => {
+    if (!Array.isArray(v) || v.length !== 3 || !v.every(finite)) fail(label + ' requires 3 finite numbers');
+    return [...v];
+  };
+  const same = (a, b) => a.every((v, i) => Math.abs(v - b[i]) < 1e-8);
+  if (data?.schemaVersion !== 1 || data.coordinateSystem !== 'CAD_WORLD_MM_Z_UP') fail('unsupported schema/coordinates');
+  if (!/^[a-f0-9]{64}$/.test(data.sourceSha256)) fail('missing source identity');
+  if (!Array.isArray(data.parts) || !data.parts.length || !Array.isArray(data.stages)) fail('parts/stages missing');
+  const parts = new Map(), fixed = new Set(data.fixedPartIds || []);
+  const targets = [...data.parts, ...(data.subTargets || [])];
+  for (const part of targets) {
+    if (typeof part.id !== 'string' || parts.has(part.id)) fail('duplicate/invalid part id');
+    if (typeof part.localTarget !== 'string' || !/^#?o\d+(\.\d+)*$/.test(part.localTarget)) fail(part.id + ': occurrence target missing');
+    parts.set(part.id, part);
+  }
+  for (const id of fixed) if (!parts.has(id)) fail('unknown fixed part ' + id);
+  for (const target of data.subTargets || []) if (!data.parts.some(p => p.id === target.parentPartId)) fail('unknown subtarget parent ' + target.id);
+  const stages = [], ids = new Map(), previous = new Map();
+  for (const p of parts.values()) previous.set(p.id, { translationMm: [0, 0, 0], angleDeg: 0, axis: [0, 0, 1], originMm: [0, 0, 0] });
+  let total = 0;
+  for (const stage of data.stages) {
+    if (typeof stage.id !== 'string' || ids.has(stage.id)) fail('duplicate/invalid stage id');
+    if (!finite(stage.duration) || stage.duration <= 0) fail(stage.id + ': invalid duration');
+    if (!['release', 'extract', 'park', 'hold'].includes(stage.kind)) fail(stage.id + ': unknown kind');
+    if (!Array.isArray(stage.dependsOn) || !Array.isArray(stage.motions)) fail(stage.id + ': dependencies/motions missing');
+    for (const id of stage.dependsOn) if (!ids.has(id)) fail(stage.id + ': missing/later dependency ' + id);
+    const used = new Set();
+    const motions = stage.motions.map(motion => {
+      if (!Array.isArray(motion.partIds) || !motion.partIds.length) fail(stage.id + ': empty motion');
+      const from = vec(motion.translationMm?.from, stage.id + '.from'), to = vec(motion.translationMm?.to, stage.id + '.to');
+      let rotation = null;
+      if (motion.rotation) {
+        const r = motion.rotation, axis = vec(r.axis, stage.id + '.axis'), originMm = vec(r.originMm, stage.id + '.origin');
+        const length = Math.hypot(...axis);
+        if (length < 1e-12 || !finite(r.fromDeg) || !finite(r.toDeg)) fail(stage.id + ': invalid rotation');
+        rotation = { axis: axis.map(v => v / length), originMm, fromDeg: r.fromDeg, toDeg: r.toDeg };
+      }
+      for (const id of motion.partIds) {
+        if (!parts.has(id) || used.has(id) || fixed.has(id)) fail(stage.id + ': invalid/duplicate/fixed target ' + id);
+        used.add(id);
+        const p = previous.get(id);
+        if (!same(p.translationMm, from)) fail(stage.id + ': discontinuous translation for ' + id);
+        if (rotation) {
+          if (Math.abs(p.angleDeg - rotation.fromDeg) > 1e-8) fail(stage.id + ': discontinuous angle for ' + id);
+          if (p.angleDeg !== 0 && (!same(p.axis, rotation.axis) || !same(p.originMm, rotation.originMm))) fail(stage.id + ': changed rotation datum for ' + id);
+        }
+        previous.set(id, { translationMm: to, angleDeg: rotation?.toDeg ?? p.angleDeg, axis: rotation?.axis ?? p.axis, originMm: rotation?.originMm ?? p.originMm });
+      }
+      return { partIds: [...motion.partIds], from, to, rotation };
+    });
+    for (const id of used) if (parts.get(id)?.parentPartId && used.has(parts.get(id).parentPartId)) fail(stage.id + ': parent/child driven together ' + id);
+    const parsed = { ...stage, start: total, end: total + stage.duration, motions };
+    stages.push(parsed); ids.set(stage.id, parsed); total = parsed.end;
+  }
+  const blockingIssues = (data.unresolved || []).filter(issue => issue.blocking === true);
+  const blockedStage = stages.find(stage => stage.blocked === true || stage.validation === 'blocked' || stage.motions.some(m => m.partIds.some(id => blockingIssues.some(issue => issue.partIds?.includes(id) || issue.partIds?.includes(parts.get(id)?.parentPartId) || issue.targetIds?.includes(id)))));
+  const playableDuration = blockedStage ? blockedStage.start : total;
+  const identity = () => ({ translationMm: [0, 0, 0], angleDeg: 0, axis: [0, 0, 1], originMm: [0, 0, 0] });
+  function at(seconds) {
+    if (!finite(seconds)) fail('time must be finite');
+    const time = Math.min(playableDuration, Math.max(0, seconds)), states = {};
+    for (const id of parts.keys()) states[id] = identity();
+    for (const stage of stages) {
+      if (time <= stage.start) break;
+      const f = Math.min(1, (time - stage.start) / stage.duration);
+      for (const m of stage.motions) for (const id of m.partIds) {
+        const state = states[id];
+        state.translationMm = m.from.map((v, i) => v + (m.to[i] - v) * f);
+        if (m.rotation) {
+          state.angleDeg = m.rotation.fromDeg + (m.rotation.toDeg - m.rotation.fromDeg) * f;
+          state.axis = [...m.rotation.axis]; state.originMm = [...m.rotation.originMm];
+        }
+      }
+    }
+    const stageIndex = stages.length ? Math.min(stages.length - 1, stages.findIndex(s => time < s.end) < 0 ? stages.length - 1 : stages.findIndex(s => time < s.end)) : -1;
+    return { time, total: playableDuration, stageIndex, stage: stages[stageIndex] || null, states, blocked: Boolean(blockedStage && time >= playableDuration) };
+  }
+  return { data, parts: data.parts, targets: [...parts.values()], stages, duration: playableDuration, candidateDuration: total, blockedStage: blockedStage || null, at };
+}
+
+function stateMatrix(state, glb = false) {
+  const convert = v => glb ? [v[0], v[2], -v[1]] : [...v];
+  const [x, y, z] = convert(state.axis), angle = state.angleDeg * Math.PI / 180;
+  const c = Math.cos(angle), s = Math.sin(angle), q = 1 - c;
+  const r = [x*x*q+c, y*x*q+z*s, z*x*q-y*s, 0, x*y*q-z*s, y*y*q+c, z*y*q+x*s, 0, x*z*q+y*s, y*z*q-x*s, z*z*q+c, 0, 0, 0, 0, 1];
+  const o = convert(state.originMm), t = convert(state.translationMm), scale = glb ? .001 : 1;
+  for (let i=0;i<3;i++) r[12+i] = scale*(t[i]+o[i]-r[i]*o[0]-r[4+i]*o[1]-r[8+i]*o[2]);
+  return r;
+}
+
+function applyCadFrame(player, time, model) {
+  const frame = player.at(time);
+  for (const part of player.targets) {
+    const s = frame.states[part.id], handle = model.get(part.localTarget.startsWith('#') ? part.localTarget : '#'+part.localTarget);
+    // Resolve every target at t=0 as well; the Viewer validates targets at load.
+    if (s.angleDeg) handle.rotate(s.axis, s.angleDeg, s.originMm);
+    if (s.translationMm.some(v => v !== 0)) handle.translate(s.translationMm);
+  }
+  return frame;
+}
+
 const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer'),revisionViewer=$('#revision-viewer');
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
 const cache=new Map(),plainCache=new Map(),pendingModels=new Map(),encoder=new TextEncoder();
@@ -20,6 +126,7 @@ function seekMotion(time){
   viewer.timeScale=1;viewer.play({repetitions:1,pingpong:false});viewer.currentTime=time;viewer.pause();
 }
 function showMotionProgress(){
+  updateSequence270();
   const fraction=viewer.duration>0?Math.max(0,Math.min(1,viewer.currentTime/viewer.duration)):0;
   $('#motion-progress').value=String(Math.round(fraction*1000));
   const motion=motionConfig;
@@ -39,12 +146,12 @@ async function selectMotion(index){
 function mechanisms(){return catalog?.ui?.mechanisms?.filter(g=>g.modelIndex===active)||[];}
 function updateMotionUI(){
   const groups=mechanisms(),g=groups[mechanismIndex],ready=Boolean(g?.animationName&&viewer.availableAnimations?.includes(g.animationName));
-  $('#motion').hidden=!partsUI.isAssembly()||!groups.length;$('#motion-controls').hidden=!ready;
+  $('#motion').hidden=!partsUI.isAssembly()||!groups.length;$('#motion-controls').hidden=!ready||g?.id==='sequence270'; updateSequence270();
   $('#mechanism-note').textContent=g?.note||'';
 }
 async function selectMechanism(index){
   const run=epoch,request=++mechanismSequence,g=mechanisms()[index];if(!g)return;
-  mechanismIndex=index;stopMotion();
+  const wasSequence=isSequence270();mechanismIndex=index;stopMotion();
   const clip=viewer.availableAnimations.indexOf(g.animationName);
   // Every clip contains rest transforms for unused targets, so seeking its start resets the complete assembly.
   if(viewer.availableAnimations.length)await selectMotion(clip<0?0:clip);
@@ -52,6 +159,9 @@ async function selectMechanism(index){
   await partsUI.setScope(g.partIds);if(run!==epoch||request!==mechanismSequence)return;
   for(const [i,b]of [...$('#motion-modes').children].entries()){b.classList.toggle('active',i===index);b.setAttribute('aria-pressed',String(i===index));}
   updateMotionUI();document.documentElement.dataset.mechanism=g.id;
+  if(g.id==='sequence270'&&!wasSequence){sequence270Camera={orbit:viewer.cameraOrbit,target:viewer.cameraTarget};fitSequence270(true);}
+  else if(wasSequence&&g.id!=='sequence270'&&sequence270Camera){viewer.cameraOrbit=sequence270Camera.orbit;viewer.cameraTarget=sequence270Camera.target;viewer.jumpCameraToGoal();sequence270Camera=null;}
+  updateSequence270();
 }
 function configureMotion(){
   stopMotion();mechanismIndex=0;$('#motion-modes').replaceChildren();$('#motion-modes').hidden=false;
@@ -112,7 +222,7 @@ function prepareViewer(){
   return viewerReady;
 }
 function clearState(){
-  stopMotion();partsUI.reset(true);plainCache.clear();assetCache.clear();pendingModels.clear();$('#motion').hidden=true;
+  clearSequence270();stopMotion();partsUI.reset(true);plainCache.clear();assetCache.clear();pendingModels.clear();$('#motion').hidden=true;
   epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
   mainIndex=-1;revisionIndex=-1;revisionLoading=-1;revisionRequest++;revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-select').replaceChildren();$('#revision-retry').hidden=true;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
@@ -225,7 +335,7 @@ revisionViewer.addEventListener('error',()=>{if(catalog){revisionLoading=-1;$('#
 viewer.addEventListener('load',async()=>{
   const run=epoch,request=selection;if(!catalog||cache.get(active)!==viewer.src)return;
   try{
-    await configureMotion();if(run!==epoch||request!==selection||!catalog)return;
+    setupSequence270();await configureMotion();if(run!==epoch||request!==selection||!catalog)return;
     await partsUI.configure(catalog.models[active],plainCache.get(active));if(run!==epoch||request!==selection||!catalog)return;
     await selectMechanism(0);if(run!==epoch||request!==selection||!catalog)return;
     loadingIndex=-1;if(partsUI.isAssembly())tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);
@@ -238,4 +348,59 @@ async function restoreDevice(){
   try{const pkg=await getPackage(),saved=await rememberedKey(pkg.scope);if(saved){$('#forget-device').hidden=false;$('#remember-device').checked=true;$('#device-status').textContent='此设备已保存登录记录。';let locked=false;try{locked=sessionStorage.getItem(lockFlag)==='1';}catch{}if(!locked)await unlock(saved,false,true);}}
   catch{}finally{$('#unlock').disabled=false;document.documentElement.dataset.authReady='true';}
 }
+// Reuses model-viewer's public animation API; clips are compiled by the same
+// pure evaluator used by the STEP render module. No scene-symbol mutation.
+let sequence270=null,sequence270Camera=null;
+function isSequence270(){return mechanisms()[mechanismIndex]?.id==='sequence270';}
+function setupSequence270(){
+ sequence270=null;sequence270Camera=null;
+ const buffer=plainCache.get(active);if(!buffer)return;
+ const size=new DataView(buffer).getUint32(12,true),j=JSON.parse(new TextDecoder().decode(new Uint8Array(buffer,20,size)));
+ if(j.extras?.sequence270)sequence270=createSequencePlayer(j.extras.sequence270.data);
+ $('#sequence270-boundary-list').replaceChildren(...(sequence270?.data.unresolved||[]).map(issue=>{const li=document.createElement('li');li.textContent=issue.problem;return li;}));
+}
+function clearSequence270(){sequence270=null;sequence270Camera=null;$('#sequence270').hidden=true;for(const id of ['sequence270-stage','sequence270-note','sequence270-blocked','sequence270-boundary-list'])$('#'+id).replaceChildren();}
+function updateSequence270(){
+ const panel=$('#sequence270');if(!sequence270){panel.hidden=true;return;}
+ panel.hidden=!partsUI.isAssembly()||!isSequence270();
+ if(panel.hidden)return;
+ const p=sequence270,clock=viewer.currentTime||0,state=p.at(Math.abs(clock-p.duration)<1e-5?p.duration:clock),stage=state.stage;
+ $('#sequence270-progress').value=String(Math.round(state.time/p.duration*1000));
+ $('#sequence270-stage').textContent=`${state.stageIndex+1}/${p.stages.length} · ${state.blocked?'已停在阻塞前：':''}${stage?.label||'269零位'} · ${state.time.toFixed(2)} / ${p.duration.toFixed(2)} s`;
+ $('#sequence270-note').textContent=(stage?.kind==='park'?'此段为脱离后的展示排布。 ':'')+(stage?.note||'')+' '+(p.data.status?.startsWith('SAFE_PREFIX')?'本次只包含局部拆卸前缀。':'当前为拆装候选。')+'未验证部分不代表机械可拆通过。';
+ const held=(p.data.heldPartIds||[]).map(id=>p.parts.find(part=>part.id===id)?.name||id);
+ $('#sequence270-blocked').textContent=p.data.unresolved?.some(v=>v.blocking)?(p.blockedStage?'当前候选只播放至阻塞前。':'仅播放当前已给出的阶段，其余零件保持原位。')+p.data.unresolved.filter(v=>v.blocking).map(v=>v.problem).join(' '):(held.length?'连接尚未定义，原位保留：'+held.join('、')+'。':'');
+ document.documentElement.dataset.sequence270Time=String(state.time);
+}
+function fitSequence270(allStages=false,reviewAngle=false){
+ if(!sequence270)return;
+ const lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity],points=[],p=sequence270;
+ // Playback fits the full path once. The explicit fit button frames the current
+ // pose, so the final three columns do not shrink to the transfer corridor.
+ for(const time of (allStages?[0,...p.stages.map(s=>Math.min(s.end,p.duration))]:[viewer.currentTime||0])){
+  const frame=p.at(time);
+  for(const part of p.targets){if(!part.boundsMm)continue;const m=stateMatrix(frame.states[part.id],true);
+   for(let i=0;i<8;i++){const a=part.boundsMm[(i>>0)&1][0],b=part.boundsMm[(i>>1)&1][1],c=part.boundsMm[(i>>2)&1][2],v=[a*.001,c*.001,-b*.001],q=[0,1,2].map(k=>m[k]*v[0]+m[4+k]*v[1]+m[8+k]*v[2]+m[12+k]);if(reviewAngle)points.push(q);for(let k=0;k<3;k++){lo[k]=Math.min(lo[k],q[k]);hi[k]=Math.max(hi[k],q[k]);}}
+  }
+ }
+ const center=lo.map((v,k)=>(v+hi[k])/2),radius=Math.hypot(...lo.map((v,k)=>(hi[k]-v)/2)),orbit=viewer.getCameraOrbit(),fov=viewer.getFieldOfView()*Math.PI/180,aspect=Math.max(.2,viewer.clientWidth/viewer.clientHeight),vertical=Math.min(fov,2*Math.atan(Math.tan(fov/2)*aspect));
+ let theta=orbit.theta,phi=orbit.phi,distance=1.15*radius/Math.sin(vertical/2);
+ if(reviewAngle){
+  theta=50*Math.PI/180;phi=55*Math.PI/180;
+  const direction=[Math.sin(phi)*Math.sin(theta),Math.cos(phi),Math.sin(phi)*Math.cos(theta)],right=[Math.cos(theta),0,-Math.sin(theta)],up=[-Math.cos(phi)*Math.sin(theta),Math.sin(phi),-Math.cos(phi)*Math.cos(theta)],dot=(a,b)=>a.reduce((n,v,k)=>n+v*b[k],0),projected=points.map(q=>{const v=q.map((x,k)=>x-center[k]);return[dot(v,right),dot(v,up)];});
+  const dx=(Math.min(...projected.map(v=>v[0]))+Math.max(...projected.map(v=>v[0])))/2,dy=(Math.min(...projected.map(v=>v[1]))+Math.max(...projected.map(v=>v[1])))/2;for(let k=0;k<3;k++)center[k]+=dx*right[k]+dy*up[k];
+  distance=Math.max(.02,...points.map(q=>{const v=q.map((x,k)=>x-center[k]);return dot(v,direction)+Math.max(Math.abs(dot(v,up))/(.72*Math.tan(fov/2)),Math.abs(dot(v,right))/(.85*Math.tan(fov/2)*aspect));}));
+ }
+ viewer.cameraTarget=center.map(v=>v+'m').join(' ');viewer.cameraOrbit=`${theta}rad ${phi}rad ${distance}m`;viewer.jumpCameraToGoal();
+}
+function sequence270Seek(time){if(!sequence270)return;stopMotion();seekMotion(Math.min(sequence270.duration,Math.max(0,time)));showMotionProgress();}
+function sequence270Step(direction){const t=viewer.currentTime||0,p=sequence270;if(!p)return;const ends=[0,...p.stages.map(s=>s.end).filter(t=>t<=p.duration)],target=direction>0?ends.find(v=>v>t+1e-5):ends.filter(v=>v<t-1e-5).at(-1);sequence270Seek(target??(direction>0?p.duration:0));}
+function sequence270Play(direction){
+ if(!sequence270||!isSequence270())return;stopMotion();const run=epoch,p=sequence270;let time=viewer.currentTime||0,last=performance.now();if((direction>0&&time>=p.duration-1e-5)||(direction<0&&time<=1e-5))return;
+ seekMotion(time);fitSequence270(true);
+ const frame=now=>{if(run!==epoch||!isSequence270()||!partsUI.isAssembly())return;time=Math.min(p.duration,Math.max(0,time+(now-last)/1000*direction));last=now;seekMotion(time);showMotionProgress();if(direction>0?time<p.duration:time>0)motionFrame=requestAnimationFrame(frame);else motionFrame=0;};motionFrame=requestAnimationFrame(frame);
+}
+$('#sequence270-forward').onclick=()=>sequence270Play(1);$('#sequence270-reverse').onclick=()=>sequence270Play(-1);$('#sequence270-pause').onclick=stopMotion;$('#sequence270-prev').onclick=()=>sequence270Step(-1);$('#sequence270-next').onclick=()=>sequence270Step(1);$('#sequence270-fit').onclick=()=>fitSequence270(false,true);
+$('#sequence270-progress').oninput=()=>sequence270Seek(sequence270.duration*Number($('#sequence270-progress').value)/1000);
+
 restoreDevice();

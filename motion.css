@@ -1,2 +1,4 @@
 #motion{padding:14px 0 8px;border-top:1px solid #e1e8eb;margin-top:8px}.motion-buttons{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}#motion-progress{width:100%;padding:0;accent-color:#146578;cursor:pointer;min-height:30px}#motion-status{display:block;font-size:13px;color:#28596a;line-height:1.7}#motion label{font-size:12px;color:#617784;margin-bottom:0}
 .remember-choice{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px}.remember-choice input{width:auto;margin:0;accent-color:#146578}#forget-device{font-size:12px;padding:7px 12px}
+
+#sequence270{border:1px solid #667;padding:12px;border-radius:8px}#sequence270-progress{width:100%;margin:10px 0}#sequence270-stage{display:block}#sequence270-blocked{color:#b76b15}
