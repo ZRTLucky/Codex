@@ -1,11 +1,16 @@
 import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs';
 import {createPartsController} from './parts-controller.mjs';
-const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer');
+const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer'),revisionViewer=$('#revision-viewer');
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
-const cache=new Map(),plainCache=new Map(),encoder=new TextEncoder();
+const cache=new Map(),plainCache=new Map(),pendingModels=new Map(),encoder=new TextEncoder();
+let mainIndex=-1,revisionIndex=-1,revisionRequest=0,revisionLoading=-1;
 let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0;
 const pageIdentity=new URL('.',location.href).href,lockFlag='cad-preview-locked:'+pageIdentity;
-const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),stopMotion,tell});
+const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),revisionViewer,stopMotion,tell,onModeChange:mode=>{
+  if(!catalog)return;
+  if(mode==='revision')selectRevision(Number($('#revision-select').value));
+  else if(mode==='assembly'&&document.documentElement.dataset.loaded!==String(mainIndex))selectModel(mainIndex);
+}});
 const travelSeconds=()=>Number($('#motion-duration').value)||3;
 function stopMotion(){cancelAnimationFrame(motionFrame);motionFrame=0;viewer.pause?.();$('#motion-play').textContent='往返播放';}
 function seekMotion(time){
@@ -32,7 +37,7 @@ async function selectMotion(index){
   $('#motion-low').textContent=motionConfig?.startLabel||'起点';$('#motion-high').textContent=motionConfig?.endLabel||'终点';$('label[for="motion-progress"]').textContent=motionConfig?.progressLabel||'运动进度';showMotionProgress();
 }
 function configureMotion(){
-  stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=!available.length;if(!available.length)return;
+  stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=!partsUI.isAssembly()||!available.length;if(!available.length)return;
   $('#motion-modes').replaceChildren();$('#motion-modes').hidden=available.length<2;
   for(const [i,name]of available.entries()){const b=document.createElement('button');b.type='button';b.textContent=catalog.models[active].motions?.find(m=>m.animationName===name)?.label||name;b.onclick=()=>selectMotion(i);$('#motion-modes').append(b);}
   return selectMotion(0);
@@ -74,34 +79,58 @@ function prepareViewer(){
   return viewerReady;
 }
 function clearState(){
-  stopMotion();partsUI.reset(true);plainCache.clear();$('#motion').hidden=true;
+  stopMotion();partsUI.reset(true);plainCache.clear();pendingModels.clear();$('#motion').hidden=true;
   epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
+  mainIndex=-1;revisionIndex=-1;revisionLoading=-1;revisionRequest++;revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-select').replaceChildren();$('#revision-retry').hidden=true;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
-  $('#models').replaceChildren();$('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
+  $('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
+}
+async function modelUrl(index,run,progress){
+  if(cache.has(index))return cache.get(index);
+  if(pendingModels.has(index))return pendingModels.get(index);
+  const entry=catalog.models[index],k=key,parent=base,signal=controller.signal;
+  const task=(async()=>{
+    const data=await decrypt(entry,entry.aad,k,parent,signal,progress);
+    assert(data.byteLength===entry.plainBytes&&hex(await crypto.subtle.digest('SHA-256',data))===entry.plainSha256);
+    assert(new DataView(data).getUint32(0,true)===0x46546c67);
+    if(run!==epoch)return null;
+    plainCache.set(index,data);const url=URL.createObjectURL(new Blob([data],{type:'model/gltf-binary'}));cache.set(index,url);return url;
+  })();
+  pendingModels.set(index,task);
+  try{return await task;}finally{if(pendingModels.get(index)===task)pendingModels.delete(index);}
+}
+async function selectRevision(index){
+  if(!catalog?.ui.revisionModelIndices.includes(index))return;
+  const entry=catalog.models[index];
+  if(index===revisionLoading){if(partsUI.isRevision())tell('正在加载'+entry.label+'…');return;}
+  if(index===revisionIndex&&revisionViewer.loaded&&revisionViewer.src===cache.get(index)){if(partsUI.isRevision())tell(entry.label+'已加载，可旋转查看');return;}
+  const run=epoch,request=++revisionRequest;revisionIndex=index;revisionLoading=index;
+  revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-retry').hidden=true;
+  const report=message=>{if(run===epoch&&request===revisionRequest&&partsUI.isRevision())tell(message);};
+  report('正在加载'+entry.label+'…');
+  try{
+    await prepareViewer();await revisionViewer.updateComplete;if(run!==epoch||request!==revisionRequest)return;
+    const url=await modelUrl(index,run,n=>report('正在下载'+entry.label+'：'+(n/1048576).toFixed(2)+' MB'));
+    if(run!==epoch||request!==revisionRequest)return;
+    revisionViewer.cameraOrbit='35deg 65deg auto';revisionViewer.cameraTarget='auto auto auto';revisionViewer.alt=entry.label;revisionViewer.src=url;
+    report('解密完成，正在显示'+entry.label+'…');
+  }catch(e){if(run===epoch&&request===revisionRequest){revisionLoading=-1;$('#revision-retry').hidden=false;if(partsUI.isRevision())tell(e.name==='OperationError'?'修订模型解密失败，文件可能已损坏':e.message,true);}}
 }
 async function selectModel(index){
   if(index===loadingIndex)return;
   if(index===active&&document.documentElement.dataset.loaded===String(index)&&viewer.src===cache.get(index)){
-    $('#motion').hidden=partsUI.isSingle()||!(viewer.availableAnimations?.length);tell(catalog.models[index].label+'已加载，可旋转查看');return;
+    $('#motion').hidden=!partsUI.isAssembly()||!(viewer.availableAnimations?.length);if(partsUI.isAssembly())tell(catalog.models[index].label+'已加载，可旋转查看');return;
   }
-  const run=epoch,request=++selection,entry=catalog.models[index],k=key,parent=base,signal=controller.signal;active=index;
+  const run=epoch,request=++selection,entry=catalog.models[index];active=index;
   loadingIndex=index;
   stopMotion();partsUI.reset();$('#motion').hidden=true;viewer.removeAttribute('src');
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
-  for(const [i,button]of [...$('#models').children].entries())button.classList.toggle('active',i===index);
-  tell('正在加载'+entry.label+'…');
+  if(partsUI.isAssembly())tell('正在加载'+entry.label+'…');
   try{
     await prepareViewer();await viewer.updateComplete;if(run!==epoch||request!==selection)return;
-    let objectUrl=cache.get(index);
-    if(!objectUrl){
-      const data=await decrypt(entry,entry.aad,k,parent,signal,n=>{if(run===epoch&&request===selection)tell('正在下载'+entry.label+'：'+(n/1048576).toFixed(2)+' MB');});
-      assert(data.byteLength===entry.plainBytes&&hex(await crypto.subtle.digest('SHA-256',data))===entry.plainSha256);
-      assert(new DataView(data).getUint32(0,true)===0x46546c67);
-      if(run!==epoch||request!==selection)return;
-      plainCache.set(index,data);objectUrl=URL.createObjectURL(new Blob([data],{type:'model/gltf-binary'}));cache.set(index,objectUrl);
-    }
-    if(run!==epoch||request!==selection)return;tell('解密完成，正在显示'+entry.label+'…');viewer.src=objectUrl;
+    const objectUrl=await modelUrl(index,run,n=>{if(run===epoch&&request===selection&&partsUI.isAssembly())tell('正在下载'+entry.label+'：'+(n/1048576).toFixed(2)+' MB');});
+    if(run!==epoch||request!==selection)return;if(partsUI.isAssembly())tell('解密完成，正在显示'+entry.label+'…');viewer.src=objectUrl;
   }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;tell(e.name==='OperationError'?'模型解密失败，文件可能已损坏或密钥不匹配':e.message,true);document.documentElement.dataset.error='true';}}
 }
 async function getPackage(){
@@ -115,13 +144,17 @@ async function openPackage(candidate,pkg,run,save){
     const unlocked=JSON.parse(new TextDecoder().decode(plain));
     assert(unlocked.version===1&&unlocked.packageId===manifest.packageId&&typeof unlocked.title==='string'&&typeof unlocked.note==='string'&&Array.isArray(unlocked.models)&&unlocked.models.length>0&&unlocked.models.length<=20);
     for(const [i,m]of unlocked.models.entries()){descriptor(m);assert(typeof m.label==='string'&&m.aad==='rp1:'+manifest.packageId+':model:'+i&&/^[a-f0-9]{64}$/.test(m.plainSha256)&&Number.isSafeInteger(m.plainBytes)&&m.plainBytes>=20&&m.plainBytes<=64*1024*1024);}
-    if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;
+    const ui=unlocked.ui,indices=ui?.revisionModelIndices;
+    assert(Number.isInteger(ui?.mainModelIndex)&&ui.mainModelIndex>=0&&ui.mainModelIndex<unlocked.models.length&&Array.isArray(indices)&&new Set(indices).size===indices.length&&indices.every(i=>Number.isInteger(i)&&i>=0&&i<unlocked.models.length&&i!==ui.mainModelIndex));
+    assert(indices.length+1===unlocked.models.length);
+    if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;mainIndex=ui.mainModelIndex;
     $('#title').textContent=catalog.title;$('#note').textContent=catalog.note;
-    for(const [i,m]of catalog.models.entries()){const button=document.createElement('button');button.type='button';button.textContent=m.label;button.addEventListener('click',()=>selectModel(i));$('#models').append(button);}
+    for(const i of indices){const option=document.createElement('option');option.value=String(i);option.textContent=catalog.models[i].label;$('#revision-select').append(option);}
+    $('#mode-revision').disabled=!indices.length;$('#view-modes').hidden=false;
     $('#gate').hidden=true;$('#preview').hidden=false;
     if(save)try{await rememberKey(pkg.scope,pageIdentity,candidate);$('#forget-device').hidden=false;$('#device-status').textContent='已记住此设备；下次打开本页会自动解锁。';}catch{$('#device-status').textContent='此浏览器无法保存登录，本次仍可正常预览。';}
     try{sessionStorage.removeItem(lockFlag);}catch{}
-    if(run===epoch)await selectModel(0);
+    if(run===epoch)partsUI.setMode('assembly');
 }
 async function unlock(value,save,fromDevice=false){
   if(!globalThis.isSecureContext||!crypto.subtle){tell('请通过 HTTPS 或本机 localhost 打开预览',true);return;}
@@ -145,8 +178,19 @@ $('#motion-play').addEventListener('click',()=>{
   const run=epoch,frame=()=>{if(run!==epoch)return;showMotionProgress();if(!viewer.paused)motionFrame=requestAnimationFrame(frame);};motionFrame=requestAnimationFrame(frame);
 });
 $('#motion-duration').addEventListener('change',()=>{if(viewer.paused)stopMotion();viewer.timeScale=viewer.duration/travelSeconds();});
-viewer.addEventListener('load',async()=>{const run=epoch,request=selection;if(catalog&&cache.get(active)===viewer.src){await configureMotion();if(run!==epoch||request!==selection||!catalog)return;partsUI.configure(catalog.models[active],plainCache.get(active));loadingIndex=-1;tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);}});
-viewer.addEventListener('error',()=>{if(catalog){loadingIndex=-1;tell('模型显示失败，点击模型按钮可重试',true);document.documentElement.dataset.error='true';}});
+$('#revision-select').addEventListener('change',()=>selectRevision(Number($('#revision-select').value)));
+$('#revision-retry').addEventListener('click',()=>selectRevision(Number($('#revision-select').value)));
+revisionViewer.addEventListener('load',()=>{if(catalog&&cache.get(revisionIndex)===revisionViewer.src){revisionLoading=-1;revisionViewer.dataset.loaded=String(revisionIndex);if(partsUI.isRevision())tell(catalog.models[revisionIndex].label+'已加载，可旋转查看');}});
+revisionViewer.addEventListener('error',()=>{if(catalog){revisionLoading=-1;$('#revision-retry').hidden=false;if(partsUI.isRevision())tell('修订模型显示失败，请重新加载',true);}});
+viewer.addEventListener('load',async()=>{
+  const run=epoch,request=selection;if(!catalog||cache.get(active)!==viewer.src)return;
+  try{
+    await configureMotion();if(run!==epoch||request!==selection||!catalog)return;
+    await partsUI.configure(catalog.models[active],plainCache.get(active));if(run!==epoch||request!==selection||!catalog)return;
+    loadingIndex=-1;if(partsUI.isAssembly())tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);
+  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;document.documentElement.dataset.error='true';if(partsUI.isAssembly())tell('装配显示初始化失败：'+e.message,true);}}
+});
+viewer.addEventListener('error',()=>{if(catalog){loadingIndex=-1;if(partsUI.isAssembly())tell('装配体显示失败，点击“装配体”可重试',true);document.documentElement.dataset.error='true';}});
 window.addEventListener('pagehide',clearState);
 async function restoreDevice(){
   $('#unlock').disabled=true;
