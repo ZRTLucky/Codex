@@ -4,14 +4,15 @@ const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer'),rev
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
 const cache=new Map(),plainCache=new Map(),pendingModels=new Map(),encoder=new TextEncoder();
 let mainIndex=-1,revisionIndex=-1,revisionRequest=0,revisionLoading=-1;
-let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0;
+let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0,mechanismSequence=0,mechanismIndex=0;
 const pageIdentity=new URL('.',location.href).href,lockFlag='cad-preview-locked:'+pageIdentity;
 const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),revisionViewer,stopMotion,tell,onModeChange:mode=>{
   if(!catalog)return;
   if(mode==='revision')selectRevision(Number($('#revision-select').value));
   else if(mode==='assembly'&&document.documentElement.dataset.loaded!==String(mainIndex))selectModel(mainIndex);
+  updateMotionUI();
 }});
-const travelSeconds=()=>Number($('#motion-duration').value)||3;
+const travelSeconds=()=>Number($('#motion-duration').value)||1;
 function stopMotion(){cancelAnimationFrame(motionFrame);motionFrame=0;viewer.pause?.();$('#motion-play').textContent='往返播放';}
 function seekMotion(time){
   // This installed viewer resets mixer time when seeking a stopped action.
@@ -33,14 +34,29 @@ async function selectMotion(index){
   const run=epoch,request=selection,motionRequest=++motionSequence,entry=catalog.models[active],names=viewer.availableAnimations;
   stopMotion();const name=names[index];motionConfig=entry.motions?.find(m=>m.animationName===name)||(index===0?entry.motion:null);
   viewer.animationCrossfadeDuration=0;viewer.animationName=name;await viewer.updateComplete;if(run!==epoch||request!==selection||motionRequest!==motionSequence)return;seekMotion(0);
-  for(const [i,b]of [...$('#motion-modes').children].entries())b.classList.toggle('active',i===index);
   $('#motion-low').textContent=motionConfig?.startLabel||'起点';$('#motion-high').textContent=motionConfig?.endLabel||'终点';$('label[for="motion-progress"]').textContent=motionConfig?.progressLabel||'运动进度';showMotionProgress();
 }
+function mechanisms(){return catalog?.ui?.mechanisms?.filter(g=>g.modelIndex===active)||[];}
+function updateMotionUI(){
+  const groups=mechanisms(),g=groups[mechanismIndex],ready=Boolean(g?.animationName&&viewer.availableAnimations?.includes(g.animationName));
+  $('#motion').hidden=!partsUI.isAssembly()||!groups.length;$('#motion-controls').hidden=!ready;
+  $('#mechanism-note').textContent=g?.note||'';
+}
+async function selectMechanism(index){
+  const run=epoch,request=++mechanismSequence,g=mechanisms()[index];if(!g)return;
+  mechanismIndex=index;stopMotion();
+  const clip=viewer.availableAnimations.indexOf(g.animationName);
+  // Every clip contains rest transforms for unused targets, so seeking its start resets the complete assembly.
+  if(viewer.availableAnimations.length)await selectMotion(clip<0?0:clip);
+  if(run!==epoch||request!==mechanismSequence)return;
+  await partsUI.setScope(g.partIds);if(run!==epoch||request!==mechanismSequence)return;
+  for(const [i,b]of [...$('#motion-modes').children].entries()){b.classList.toggle('active',i===index);b.setAttribute('aria-pressed',String(i===index));}
+  updateMotionUI();document.documentElement.dataset.mechanism=g.id;
+}
 function configureMotion(){
-  stopMotion();const available=viewer.availableAnimations||[];$('#motion').hidden=!partsUI.isAssembly()||!available.length;if(!available.length)return;
-  $('#motion-modes').replaceChildren();$('#motion-modes').hidden=available.length<2;
-  for(const [i,name]of available.entries()){const b=document.createElement('button');b.type='button';b.textContent=catalog.models[active].motions?.find(m=>m.animationName===name)?.label||name;b.onclick=()=>selectMotion(i);$('#motion-modes').append(b);}
-  return selectMotion(0);
+  stopMotion();mechanismIndex=0;$('#motion-modes').replaceChildren();$('#motion-modes').hidden=false;
+  for(const [i,g]of mechanisms().entries()){const b=document.createElement('button');b.type='button';b.textContent=g.label;b.onclick=()=>selectMechanism(i).catch(e=>tell('联动切换失败：'+e.message,true));$('#motion-modes').append(b);}
+  updateMotionUI();
 }
 function moveTo(fraction){
   if(!viewer.duration)return;stopMotion();const start=viewer.currentTime,target=Math.min(Math.max(0,viewer.duration-1e-6),viewer.duration*fraction),began=performance.now(),run=epoch;
@@ -74,12 +90,29 @@ async function decrypt(d,aad,k,parent,signal,progress){
   return crypto.subtle.decrypt({name:'AES-GCM',iv:a.slice(4,16),additionalData:encoder.encode(aad),tagLength:128},k,a.slice(16));
 }
 let viewerReady;
+const assetCache=new Map();
+async function segmentedGlb(entry,k,parent,signal,progress){
+  let received=0;
+  async function asset(d){
+    if(assetCache.has(d.sha256))return assetCache.get(d.sha256);
+    const data=await decrypt(d,d.aad,k,parent,signal);
+    assert(data.byteLength===d.plainBytes&&hex(await crypto.subtle.digest('SHA-256',data))===d.plainSha256);
+    if(signal.aborted)throw new DOMException('Preview locked or switched','AbortError');
+    assetCache.set(d.sha256,data);received+=d.bytes;progress?.(received);return data;
+  }
+  const layout=await asset(entry.layout),segments=new Array(entry.segments.length);let cursor=0;
+  await Promise.all(Array.from({length:Math.min(4,entry.segments.length)},async()=>{while(cursor<entry.segments.length){const i=cursor++;segments[i]=await asset(entry.segments[i]);}}));
+  assert(!signal.aborted);const size=segments.reduce((n,b)=>n+b.byteLength,0),out=new Uint8Array(28+layout.byteLength+size),h=new DataView(out.buffer);
+  h.setUint32(0,0x46546c67,true);h.setUint32(4,2,true);h.setUint32(8,out.length,true);h.setUint32(12,layout.byteLength,true);h.setUint32(16,0x4e4f534a,true);out.set(new Uint8Array(layout),20);
+  h.setUint32(20+layout.byteLength,size,true);h.setUint32(24+layout.byteLength,0x004e4942,true);let offset=28+layout.byteLength;
+  for(const b of segments){out.set(new Uint8Array(b),offset);offset+=b.byteLength;}return out.buffer;
+}
 function prepareViewer(){
   if(!viewerReady){window.ModelViewerElement={meshoptDecoderLocation:new URL('./meshopt_decoder.js',import.meta.url).href};viewerReady=import('./model-viewer.min.js').then(()=>customElements.whenDefined('model-viewer'));}
   return viewerReady;
 }
 function clearState(){
-  stopMotion();partsUI.reset(true);plainCache.clear();pendingModels.clear();$('#motion').hidden=true;
+  stopMotion();partsUI.reset(true);plainCache.clear();assetCache.clear();pendingModels.clear();$('#motion').hidden=true;
   epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
   mainIndex=-1;revisionIndex=-1;revisionLoading=-1;revisionRequest++;revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-select').replaceChildren();$('#revision-retry').hidden=true;
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
@@ -91,7 +124,7 @@ async function modelUrl(index,run,progress){
   if(pendingModels.has(index))return pendingModels.get(index);
   const entry=catalog.models[index],k=key,parent=base,signal=controller.signal;
   const task=(async()=>{
-    const data=await decrypt(entry,entry.aad,k,parent,signal,progress);
+    const data=entry.transport==='segmented-glb-v2'?await segmentedGlb(entry,k,parent,signal,progress):await decrypt(entry,entry.aad,k,parent,signal,progress);
     assert(data.byteLength===entry.plainBytes&&hex(await crypto.subtle.digest('SHA-256',data))===entry.plainSha256);
     assert(new DataView(data).getUint32(0,true)===0x46546c67);
     if(run!==epoch)return null;
@@ -143,7 +176,14 @@ async function openPackage(candidate,pkg,run,save){
     const plain=await decrypt(manifest.catalog,'rp1:'+manifest.packageId+':catalog',candidate,manifestUrl,signal);
     const unlocked=JSON.parse(new TextDecoder().decode(plain));
     assert(unlocked.version===1&&unlocked.packageId===manifest.packageId&&typeof unlocked.title==='string'&&typeof unlocked.note==='string'&&Array.isArray(unlocked.models)&&unlocked.models.length>0&&unlocked.models.length<=20);
-    for(const [i,m]of unlocked.models.entries()){descriptor(m);assert(typeof m.label==='string'&&m.aad==='rp1:'+manifest.packageId+':model:'+i&&/^[a-f0-9]{64}$/.test(m.plainSha256)&&Number.isSafeInteger(m.plainBytes)&&m.plainBytes>=20&&m.plainBytes<=64*1024*1024);}
+    for(const [i,m]of unlocked.models.entries()){
+      assert(typeof m.label==='string'&&m.aad==='rp1:'+manifest.packageId+':model:'+i&&/^[a-f0-9]{64}$/.test(m.plainSha256)&&Number.isSafeInteger(m.plainBytes)&&m.plainBytes>=20&&m.plainBytes<=64*1024*1024);
+      if(m.transport==='segmented-glb-v2'){
+        assert(Array.isArray(m.segments)&&m.segments.length>0&&m.segments.length<=500);
+        for(const d of [m.layout,...m.segments]){descriptor(d);assert(/^[a-f0-9]{64}$/.test(d.plainSha256)&&d.aad==='rp2:'+manifest.packageId+':asset:'+d.plainSha256&&Number.isSafeInteger(d.plainBytes)&&d.plainBytes>0&&d.bytes===d.plainBytes+32);}
+        assert(m.layout.plainBytes%4===0&&28+m.layout.plainBytes+m.segments.reduce((n,d)=>n+d.plainBytes,0)===m.plainBytes);
+      }else{assert(!m.transport);descriptor(m);}
+    }
     const ui=unlocked.ui,indices=ui?.revisionModelIndices;
     assert(Number.isInteger(ui?.mainModelIndex)&&ui.mainModelIndex>=0&&ui.mainModelIndex<unlocked.models.length&&Array.isArray(indices)&&new Set(indices).size===indices.length&&indices.every(i=>Number.isInteger(i)&&i>=0&&i<unlocked.models.length&&i!==ui.mainModelIndex));
     assert(indices.length+1===unlocked.models.length);
@@ -187,6 +227,7 @@ viewer.addEventListener('load',async()=>{
   try{
     await configureMotion();if(run!==epoch||request!==selection||!catalog)return;
     await partsUI.configure(catalog.models[active],plainCache.get(active));if(run!==epoch||request!==selection||!catalog)return;
+    await selectMechanism(0);if(run!==epoch||request!==selection||!catalog)return;
     loadingIndex=-1;if(partsUI.isAssembly())tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);
   }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;document.documentElement.dataset.error='true';if(partsUI.isAssembly())tell('装配显示初始化失败：'+e.message,true);}}
 });
