@@ -222,18 +222,25 @@ return { springCenterline };
 
 const opTorsion284 = (() => {
 
-// Axial layout of the lower, two-turn torsion spring.
-const spring285Axial = Object.freeze({
-  padTopOldZ: 26.55,
+// The wire is modeled in its nominal installed shape. The anchor force model is planar.
+const spring290Axial = Object.freeze({
+  nylonTopOldZ: 28.437524023444834,
   wireRadiusMm: .175,
   pitchMm: .42,
-  bendRadiusMm: .40,
   pitchLeadTurns: .10,
-  fixedFootTipOldZ: 24.25,
-  movingFootTipOldZ: 29.50,
+  bendRadiusMm: .40,
+  primaryInsideAngleDeg: 80,
+  fixedFootTipOldZ: 26.137524023444834,
+  movingEarBottomOldZ: 27.95,
+  movingEarTopOldZ: 29.45,
+  movingExposureBeforeBendMm: .40,
+  retentionBendRadiusMm: .40,
+  retentionTailMm: .30,
+  retentionTurnDeg: 20,
 });
 
 const TAU = 2 * Math.PI;
+const RAD = Math.PI / 180;
 const sample = (count, point) => Array.from({ length: count + 1 }, (_, i) => point(i / count));
 const offset = (point, unit, distance, z) => [point[0] + unit[0] * distance, point[1] + unit[1] * distance, z];
 
@@ -247,42 +254,62 @@ function pitchRun(turn, total, ramp) {
   return turn - ramp / 2;
 }
 
-function springSegments285(row, oldToWorld) {
+function bentLead(base, outward, arm, z, direction, holeMidZ) {
+  const { bendRadiusMm: radius, primaryInsideAngleDeg: inside } = spring290Axial;
+  const sweep = (180 - inside) * RAD;
+  const tilt = (90 - inside) * RAD;
+  const reach = axial => arm - direction * Math.tan(tilt) * (axial - holeMidZ);
+  const elbowExitZ = z + direction * radius * (1 - Math.cos(sweep));
+  const startReach = reach(elbowExitZ) - radius * Math.sin(sweep);
+  const point = (s, axial) => offset(base, outward, s, axial);
+  const curve = sample(16, t => {
+    const theta = sweep * t;
+    return point(startReach + radius * Math.sin(theta), z + direction * radius * (1 - Math.cos(theta)));
+  });
+  return { curve, point, reach, tilt };
+}
+
+function springSegments290(row, oldToWorld, retentionTurnDeg = spring290Axial.retentionTurnDeg) {
   const { R, N, alpha_deg: alphaDeg, angle, coil_xy_old_mm: coil } = row.spring;
-  const { padTopOldZ, wireRadiusMm, pitchMm, bendRadiusMm: bend, pitchLeadTurns,
-    fixedFootTipOldZ, movingFootTipOldZ } = spring285Axial;
-  const half = alphaDeg * Math.PI / 360;
+  const { nylonTopOldZ, wireRadiusMm, pitchMm, pitchLeadTurns, fixedFootTipOldZ,
+    movingEarBottomOldZ, movingEarTopOldZ, movingExposureBeforeBendMm,
+    retentionBendRadiusMm, retentionTailMm } = spring290Axial;
+  const half = alphaDeg * RAD / 2;
   const sine = Math.sin(half), cosine = Math.cos(half);
   const start = [-R * cosine, -R * sine], end = [R * cosine, -R * sine];
   const outwardA = [-sine, cosine], outwardB = [sine, cosine];
-  const armA = 4.5, armB = 3.25;
-  const floor = padTopOldZ + wireRadiusMm;
-  const crown = floor + pitchMm * pitchRun(N, N, pitchLeadTurns);
-  const aTip = offset(start, outwardA, armA, fixedFootTipOldZ);
-  const bTip = offset(end, outwardB, armB, movingFootTipOldZ);
-  const aBend = sample(12, t => {
-    const phase = t * Math.PI / 2;
-    return offset(start, outwardA, armA - bend + bend * Math.cos(phase),
-      floor - bend + bend * Math.sin(phase));
-  });
-  const bBend = sample(12, t => {
-    const phase = t * Math.PI / 2;
-    return offset(end, outwardB, armB - bend + bend * Math.sin(phase),
-      crown + bend * (1 - Math.cos(phase)));
-  });
+  const crown = nylonTopOldZ + wireRadiusMm;
+  const floor = crown - pitchMm * pitchRun(N, N, pitchLeadTurns);
+  const a = bentLead(start, outwardA, 4.5, crown, -1, (nylonTopOldZ + fixedFootTipOldZ) / 2);
+  const b = bentLead(end, outwardB, 3.25, floor, 1, (movingEarBottomOldZ + movingEarTopOldZ) / 2);
+  const aTip = a.point(a.reach(fixedFootTipOldZ), fixedFootTipOldZ);
+  const endZ = movingEarTopOldZ + movingExposureBeforeBendMm;
+  const stemExitReach = b.reach(endZ);
+  const bendPoint = theta => b.point(
+    stemExitReach - retentionBendRadiusMm * (Math.cos(b.tilt) - Math.cos(theta)),
+    endZ + retentionBendRadiusMm * (Math.sin(theta) - Math.sin(b.tilt)));
   const winding = sample(192, t => {
     const turn = N * t, phase = Math.PI + half + TAU * turn;
-    return [R * Math.cos(phase), R * Math.sin(phase), floor + pitchMm * pitchRun(turn, N, pitchLeadTurns)];
+    return [R * Math.cos(phase), R * Math.sin(phase), crown - pitchMm * pitchRun(turn, N, pitchLeadTurns)];
   });
   const local = [
-    { kind: 'line', points: [aTip, aBend[0]] },
-    { kind: 'arc', points: aBend },
-    { kind: 'line', points: [aBend.at(-1), winding[0]] },
+    { kind: 'line', points: [aTip, a.curve.at(-1)] },
+    { kind: 'arc', points: a.curve.toReversed() },
+    { kind: 'line', points: [a.curve[0], winding[0]] },
     { kind: 'spline', points: winding, tangents: [[sine, -cosine, 0], [sine, cosine, 0]] },
-    { kind: 'line', points: [winding.at(-1), bBend[0]] },
-    { kind: 'arc', points: bBend },
-    { kind: 'line', points: [bBend.at(-1), bTip] },
+    { kind: 'line', points: [winding.at(-1), b.curve[0]] },
+    { kind: 'arc', points: b.curve },
+    { kind: 'line', points: [b.curve.at(-1), bendPoint(b.tilt)] },
   ];
+  if (retentionTurnDeg > 0) {
+    const turn = retentionTurnDeg * RAD;
+    const arc = sample(12, t => bendPoint(b.tilt + t * turn));
+    const tailAngle = b.tilt + turn;
+    const tip = arc.at(-1);
+    local.push({ kind: 'arc', points: arc });
+    local.push({ kind: 'line', points: [tip, offset(tip, outwardB, -retentionTailMm * Math.sin(tailAngle),
+      tip[2] + retentionTailMm * Math.cos(tailAngle))] });
+  }
   const c = Math.cos(angle - Math.PI / 2), s = Math.sin(angle - Math.PI / 2);
   const rotate = ([x, y, z]) => [x * c - y * s, x * s + y * c, z];
   const transform = (vector, point) => oldToWorld.slice(0, 3).map(row =>
@@ -297,11 +324,12 @@ function springSegments285(row, oldToWorld) {
   }));
 }
 
-function springCenterline285(row, oldToWorld) {
-  return springSegments285(row, oldToWorld).flatMap(({ points }, index) => index ? points.slice(1) : points);
+function springCenterline290(row, oldToWorld) {
+  return springSegments290(row, oldToWorld).flatMap(({ points }, index) => index ? points.slice(1) : points);
 }
 
-return { springCenterline285, spring285Axial };
+
+return { springCenterline290, spring290Axial };
 })();
 
 const opState = (() => {
