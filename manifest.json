@@ -2,9 +2,9 @@
   "version": 1,
   "packageId": "1b6e3b00d647e090664af236ac21f48c",
   "catalog": {
-    "path": "data/5299d506ae0f10803c45f0b02df7edd9daaa754e386b3e1400980beb4edd319d.enc",
-    "bytes": 41062,
-    "sha256": "5299d506ae0f10803c45f0b02df7edd9daaa754e386b3e1400980beb4edd319d"
+    "path": "data/a3a29b19a1a26fa5e0262077f57a54e51341f75f62cb370c6558b2a5165018e4.enc",
+    "bytes": 45691,
+    "sha256": "a3a29b19a1a26fa5e0262077f57a54e51341f75f62cb370c6558b2a5165018e4"
   },
   "passwordUnlock": {
     "version": 1,

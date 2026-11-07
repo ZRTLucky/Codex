@@ -33,12 +33,13 @@
 <p><strong>装配联动选项</strong></p>
 <div id="motion-modes" class="motion-buttons" role="group" aria-label="装配联动选项"></div>
 <p id="mechanism-note" class="hint" role="status"></p>
+<div id="operation278" hidden></div>
 <section id="sequence270" hidden aria-label="整体顺序拆装">
 <div class="motion-buttons"><button id="sequence270-forward" type="button">顺序拆解</button><button id="sequence270-reverse" type="button">严格逆序装回</button><button id="sequence270-pause" type="button">暂停</button><button id="sequence270-prev" type="button">上一步</button><button id="sequence270-next" type="button">下一步</button><button id="sequence270-fit" type="button">查看拆解范围</button></div>
 <label for="sequence270-progress">整体拆装进度</label><input id="sequence270-progress" type="range" min="0" max="1000" step="1" value="0"><output id="sequence270-stage" aria-live="polite"></output><p id="sequence270-note" class="hint"></p><p id="sequence270-blocked" class="hint"></p><details><summary>本次模型边界与未模拟操作</summary><ul id="sequence270-boundary-list"></ul></details>
 </section><div id="motion-controls" hidden>
 <div class="motion-settings"><label for="motion-duration">单程时间</label><select id="motion-duration"><option value="1" selected>1秒</option><option value="3">3秒</option><option value="5">5秒</option></select></div>
-<div class="motion-buttons"><button id="motion-low" type="button">起点</button><button id="motion-high" type="button">终点</button><button id="motion-play" type="button">往返播放</button></div>
+<div class="motion-buttons"><button id="motion-low" type="button">起点</button><button id="motion-high" type="button">终点</button><button id="motion-play" type="button">单程播放</button><button id="motion-forward" type="button" aria-pressed="false" hidden>正转循环</button><button id="motion-reverse" type="button" aria-pressed="false" hidden>反转循环</button><button id="motion-pause" type="button" hidden disabled>暂停</button></div>
 <label for="motion-progress">运动进度</label><input id="motion-progress" type="range" min="0" max="1000" step="1" value="0"><output id="motion-status" for="motion-progress">进度 0%</output>
 </div>
 </div>
