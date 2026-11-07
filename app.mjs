@@ -220,6 +220,90 @@ function reduceSpringPoses(timedCenterlines, toleranceMm = 0.025) {
 return { springCenterline };
 })();
 
+const opTorsion284 = (() => {
+
+// Axial layout of the lower, two-turn torsion spring.
+const spring285Axial = Object.freeze({
+  padTopOldZ: 26.55,
+  wireRadiusMm: .175,
+  pitchMm: .42,
+  bendRadiusMm: .40,
+  pitchLeadTurns: .10,
+  fixedFootTipOldZ: 24.25,
+  movingFootTipOldZ: 29.50,
+});
+
+const TAU = 2 * Math.PI;
+const sample = (count, point) => Array.from({ length: count + 1 }, (_, i) => point(i / count));
+const offset = (point, unit, distance, z) => [point[0] + unit[0] * distance, point[1] + unit[1] * distance, z];
+
+function pitchRun(turn, total, ramp) {
+  const lead = distance => {
+    const u = distance / ramp;
+    return ramp * (u ** 3 - u ** 4 / 2);
+  };
+  if (turn < ramp) return lead(turn);
+  if (turn > total - ramp) return total - ramp - lead(total - turn);
+  return turn - ramp / 2;
+}
+
+function springSegments285(row, oldToWorld) {
+  const { R, N, alpha_deg: alphaDeg, angle, coil_xy_old_mm: coil } = row.spring;
+  const { padTopOldZ, wireRadiusMm, pitchMm, bendRadiusMm: bend, pitchLeadTurns,
+    fixedFootTipOldZ, movingFootTipOldZ } = spring285Axial;
+  const half = alphaDeg * Math.PI / 360;
+  const sine = Math.sin(half), cosine = Math.cos(half);
+  const start = [-R * cosine, -R * sine], end = [R * cosine, -R * sine];
+  const outwardA = [-sine, cosine], outwardB = [sine, cosine];
+  const armA = 4.5, armB = 3.25;
+  const floor = padTopOldZ + wireRadiusMm;
+  const crown = floor + pitchMm * pitchRun(N, N, pitchLeadTurns);
+  const aTip = offset(start, outwardA, armA, fixedFootTipOldZ);
+  const bTip = offset(end, outwardB, armB, movingFootTipOldZ);
+  const aBend = sample(12, t => {
+    const phase = t * Math.PI / 2;
+    return offset(start, outwardA, armA - bend + bend * Math.cos(phase),
+      floor - bend + bend * Math.sin(phase));
+  });
+  const bBend = sample(12, t => {
+    const phase = t * Math.PI / 2;
+    return offset(end, outwardB, armB - bend + bend * Math.sin(phase),
+      crown + bend * (1 - Math.cos(phase)));
+  });
+  const winding = sample(192, t => {
+    const turn = N * t, phase = Math.PI + half + TAU * turn;
+    return [R * Math.cos(phase), R * Math.sin(phase), floor + pitchMm * pitchRun(turn, N, pitchLeadTurns)];
+  });
+  const local = [
+    { kind: 'line', points: [aTip, aBend[0]] },
+    { kind: 'arc', points: aBend },
+    { kind: 'line', points: [aBend.at(-1), winding[0]] },
+    { kind: 'spline', points: winding, tangents: [[sine, -cosine, 0], [sine, cosine, 0]] },
+    { kind: 'line', points: [winding.at(-1), bBend[0]] },
+    { kind: 'arc', points: bBend },
+    { kind: 'line', points: [bBend.at(-1), bTip] },
+  ];
+  const c = Math.cos(angle - Math.PI / 2), s = Math.sin(angle - Math.PI / 2);
+  const rotate = ([x, y, z]) => [x * c - y * s, x * s + y * c, z];
+  const transform = (vector, point) => oldToWorld.slice(0, 3).map(row =>
+    row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2] + (point ? row[3] : 0));
+  return local.map(({ kind, points, tangents }) => ({
+    kind,
+    points: points.map(point => {
+      const [x, y, z] = rotate(point);
+      return transform([coil[0] + x, coil[1] + y, z], true);
+    }),
+    tangents: tangents?.map(tangent => transform(rotate(tangent), false)),
+  }));
+}
+
+function springCenterline285(row, oldToWorld) {
+  return springSegments285(row, oldToWorld).flatMap(({ points }, index) => index ? points.slice(1) : points);
+}
+
+return { springCenterline285, spring285Axial };
+})();
+
 const opState = (() => {
 const { cadPoint, cadVector } = opCoordinates; const { springCenterline } = opSpringGeometry;
 const RAD = Math.PI / 180;
@@ -234,7 +318,7 @@ const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 const positive = n => Number.isFinite(n) ? Math.max(0, n) : 0;
 const spinPhase = n => (n % 360 + 360) % 360;
 
-function createOperationState(data, contact, coupling) {
+function createOperationState(data, contact, coupling, torsion) {
   const roles = { ...standardRoles, ...data.roles };
   const contactOrigin = contact.initial(0);
   const datum = data.datum;
@@ -246,12 +330,19 @@ function createOperationState(data, contact, coupling) {
   const followerAxis = cadVector(datum, [Math.cos(followerPhase), Math.sin(followerPhase), 0]);
   const pivot = cadPoint(datum, [...contactOrigin.ear_pin_xy_old_mm, 0]);
   const ratio = data.gearing.driver / data.gearing.driven;
-  const baselineSpring = springCenterline(contactOrigin, datum);
+  const mainDriveRatio = 184 / 25;
+  const springVersion = data.torsionSpring;
+  const centerline = springVersion ? torsion?.['springCenterline' + springVersion] : springCenterline;
+  const wireRadiusMm = torsion?.['spring' + springVersion + 'Axial']?.wireRadiusMm;
+  if (springVersion && (typeof centerline !== 'function' || !(wireRadiusMm > 0))) throw Error('缺少下置扭簧中心线');
+  const baselineSpring = centerline(contactOrigin, datum);
   const baselineFlexKey = contactOrigin.q + ':' + contactOrigin.phi;
   const compressionSprings = data.compressionSprings || [];
   const pressQ = data.pressQ ?? -27;
+  const plateStopTolerance = 1e-6;
   const plateRate = 60;
   const passivePlate = data.passivePlate === true;
+  const controlsVersion = data.controlsVersion;
   if (passivePlate && (!contact.advanceFreePlate || !contact.releaseHigh)) throw Error('缺少按板接触或松手求解器');
   let state;
   let lastFlex = null, poseState = null, cachedPose = null;
@@ -260,6 +351,30 @@ function createOperationState(data, contact, coupling) {
   function reset() {
     state = { clutch: contactOrigin, drive: coupling.initialCoupling(0, 0), action: 'reset' };
     return state;
+  }
+
+  function clutchIsReset() {
+    const { clutch, drive } = state;
+    return clutch.event === 'low-stop' && drive.engaged && drive.dogContact === 'seated' &&
+      Math.abs(drive.pinionLift) < 1e-6 && Math.abs(drive.yokeLift) < 1e-6;
+  }
+
+  function canReverseSpool() {
+    const { drive } = state;
+    const clearLift = coupling.CLEAR_LIFT_MM ?? data.contact.coupling?.axialClearLiftMm;
+    return !drive.engaged && !drive.inserting && !drive.waiting && !drive.leadInSpring &&
+      drive.dogContact === 'free' && drive.pinionLift >= clearLift - 1e-6;
+  }
+
+  function windSpool(degrees, dtSeconds) {
+    if (!positive(degrees)) return state;
+    const { clutch, drive } = state;
+    if (!drive.engaged) return advance('spool', -degrees, dtSeconds);
+    const elapsed = dtSeconds === undefined ? degrees / 150 : positive(dtSeconds);
+    // At LOW the remaining axial seat travel adds helix rotation opposite the winding input.
+    const seating = clutch.event === 'low-stop' ? Math.min(drive.pinionLift, elapsed * 20) : 0;
+    const correction = seating ? -coupling.HELIX_DEG_PER_MM * seating : 0;
+    return advance('crank', (degrees + correction) / mainDriveRatio, elapsed);
   }
 
   function validatePlateTrace(before, after) {
@@ -318,7 +433,7 @@ function createOperationState(data, contact, coupling) {
       after = contact.advancePlate(before, target);
     }
     if (kind === 'release') {
-      if (!passivePlate || Math.abs(before.q - pressQ) > 1e-8) return state;
+      if (!passivePlate || Math.abs(before.q - pressQ) > plateStopTolerance) return state;
       after = contact.releaseHigh(before.q === pressQ ? before : { ...before, q: pressQ });
       validatePlateTrace(before, after);
     }
@@ -395,7 +510,8 @@ function createOperationState(data, contact, coupling) {
     const key = clutch.q + ':' + clutch.phi;
     if (!lastFlex || lastFlex.key !== key) {
       lastFlex = { key, partId: roles.spring, base: baselineSpring,
-        points: key === baselineFlexKey ? baselineSpring : springCenterline(clutch, datum) };
+        points: key === baselineFlexKey ? baselineSpring : centerline(clutch, datum),
+        wireRadiusMm };
     }
     if (compressionLift !== drive.yokeLift) {
       compressionLift = drive.yokeLift;
@@ -422,7 +538,8 @@ function createOperationState(data, contact, coupling) {
     return cachedPose;
   }
   reset();
-  return { advance, reset, pose, get state() { return state; }, pressQ, plateRate, passivePlate };
+  return { advance, reset, pose, clutchIsReset, canReverseSpool, windSpool,
+    get state() { return state; }, pressQ, plateRate, plateStopTolerance, passivePlate, controlsVersion };
 }
 
 function operationSummary(sim) {
@@ -1467,7 +1584,7 @@ function advanceCoupledCrank(contact, clutch, drive, targetGamma, seatTravelMm, 
   return { clutch: { ...clutch, steps }, drive: { ...drive, pickup, passiveSpoolDeltaDeg, leadInSteps } };
 }
 
-return { initialCoupling, advanceCoupling, advanceCoupledCrank: typeof advanceCoupledCrank === "function" ? advanceCoupledCrank : undefined };
+return { initialCoupling, advanceCoupling, advanceCoupledCrank: typeof advanceCoupledCrank === "function" ? advanceCoupledCrank : undefined, CLEAR_LIFT_MM: typeof CLEAR_LIFT_MM === "number" ? CLEAR_LIFT_MM : undefined, HELIX_DEG_PER_MM: typeof HELIX_DEG_PER_MM === "number" ? HELIX_DEG_PER_MM : undefined };
 })();
 
 const opControls = (() => {
@@ -1476,8 +1593,10 @@ function createOperationTransport(sim, scheduler = globalThis) {
   const subscribers = new Set();
   let action = null, frame = 0, last = null, error = '';
   let maxSpoolAdvanceMs = 0;
+  const controls284 = sim.controlsVersion === 284;
   const emit = () => { for (const notify of subscribers) notify(); };
   const rates = { plate: sim.plateRate || 60, crank: 90, spool: 150 };
+  const recoveryStep = 0.25;
   const settling = drive => drive.inserting || drive.leadInSpring;
   function pause(notify = true) {
     scheduler.cancelAnimationFrame(frame);
@@ -1500,8 +1619,10 @@ function createOperationTransport(sim, scheduler = globalThis) {
           current.progress += rates.plate * dt;
           const target = current.progress >= current.distance ? current.target : current.start + current.direction * current.progress;
           sim.advance('plate', target, dt);
-          if (sim.state.clutch.blocked || Math.abs(sim.state.clutch.q - current.target) < 1e-8) {
-            action = !sim.state.clutch.blocked && current.target === sim.pressQ ? { kind: 'release' } : null;
+          const reached = Math.abs(sim.state.clutch.q - current.target) <= sim.plateStopTolerance;
+          if (sim.state.clutch.blocked || reached) {
+            action = reached && current.target === sim.pressQ ?
+              { kind: 'release', control: current.control } : null;
           }
         } else {
           const amount = Math.min(Math.abs(current.target - q), rates.plate * dt);
@@ -1513,7 +1634,44 @@ function createOperationTransport(sim, scheduler = globalThis) {
       } else if (current.kind === 'release') {
         sim.advance('release', 0, dt);
         action = null;
+      } else if (current.kind === 'recover') {
+        current.pending += rates.crank * dt;
+        while (current.pending + 1e-8 >= recoveryStep && !sim.clutchIsReset()) {
+          const gamma = sim.state.clutch.gamma;
+          sim.advance('crank', recoveryStep, recoveryStep / rates.crank);
+          current.pending -= recoveryStep;
+          if (sim.state.clutch.blocked || sim.state.clutch.gamma <= gamma + 1e-8) {
+            action = null;
+            break;
+          }
+          if (sim.state.clutch.gamma - current.startGamma >= 360 && !sim.clutchIsReset()) {
+            error = '正向摇臂一圈后，离合仍待接合';
+            action = null;
+            break;
+          }
+        }
+        if (sim.clutchIsReset()) action = null;
+      } else if (current.kind === 'cup') {
+        if (!current.winding && !sim.canReverseSpool()) {
+          action = null;
+        } else {
+          const amount = Math.min(current.left, rates.spool * dt);
+          const begin = performance.now();
+          if (current.winding) sim.windSpool(amount, dt);
+          else sim.advance('spool', amount, dt);
+          maxSpoolAdvanceMs = Math.max(maxSpoolAdvanceMs, performance.now() - begin);
+          const next = sim.state;
+          const cupDelta = next.drive.spoolDeg - before.drive.spoolDeg;
+          const passive = before.drive.engaged ? 0 : next.drive.passiveSpoolDeltaDeg || 0;
+          const moved = (current.winding ? -1 : 1) * (cupDelta - passive);
+          current.left -= before.drive.engaged ? moved : Math.max(0, moved);
+          const progressed = Math.abs(cupDelta) > 1e-8 || next.clutch.gamma > before.clutch.gamma + 1e-8 ||
+            next.drive.engaged !== before.drive.engaged;
+          if (current.left < 1e-7 || (before.drive.engaged && next.clutch.blocked) || (amount > 0 && !progressed) ||
+              (!current.winding && !sim.canReverseSpool())) action = null;
+        }
       } else if (current.kind === 'crank' || current.kind === 'spool') {
+        if (current.control === 'seek') current.left = Math.max(0, current.target - before.clutch.gamma);
         const amount = Math.min(current.left, rates[current.kind] * dt);
         const begin = current.kind === 'spool' ? performance.now() : 0;
         sim.advance(current.kind, current.direction * amount, dt);
@@ -1529,7 +1687,9 @@ function createOperationTransport(sim, scheduler = globalThis) {
         if (!settling(drive) || (dt > 0 && Math.abs(drive.pinionLift - before.drive.pinionLift) < 1e-7 &&
             Math.abs(drive.spoolDeg - before.drive.spoolDeg) < 1e-7)) action = null;
       }
-      if (!action && current.kind !== 'settle' && settling(sim.state.drive)) action = { kind: 'settle' };
+      if (!action && current.kind !== 'settle' && settling(sim.state.drive)) {
+        action = { kind: 'settle', control: current.control };
+      }
       emit();
     } catch (failure) {
       pause(false);
@@ -1545,41 +1705,84 @@ function createOperationTransport(sim, scheduler = globalThis) {
     emit();
     frame = scheduler.requestAnimationFrame(tick);
   }
+  function turnSpool(winding, degrees) {
+    if (!controls284 || !Number.isFinite(degrees) || degrees <= 0 || (!winding && !sim.canReverseSpool())) return false;
+    start({ kind: 'cup', control: winding ? 'spool-forward' : 'spool-reverse', winding, left: degrees });
+    return true;
+  }
   return {
     sim,
     get action() { return action?.kind || ''; },
+    get activeControl() { return action?.control || ''; },
     get error() { return error; },
     get maxSpoolAdvanceMs() { return maxSpoolAdvanceMs; },
     subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); },
     plate(down) {
       const target = down ? sim.pressQ : 0, startQ = sim.state.clutch.q;
       start({ kind: 'plate', target, start: startQ, distance: Math.abs(target - startQ),
-        direction: Math.sign(target - startQ), progress: 0 });
+        direction: Math.sign(target - startQ), progress: 0, control: down ? 'press' : 'lift' });
     },
-    crank(degrees = Infinity) { start({ kind: 'crank', left: degrees, direction: 1 }); },
+    crank(degrees = Infinity) {
+      if (degrees > 0) start({ kind: 'crank', left: degrees, direction: 1, control: degrees === Infinity ? 'wind' : 'crank' });
+    },
+    recoverClutch() {
+      if (!controls284 || sim.clutchIsReset()) return false;
+      start({ kind: 'recover', control: 'recover', pending: 0, startGamma: sim.state.clutch.gamma });
+      return true;
+    },
+    seekCrankPhase(phase) {
+      if (!controls284 || !Number.isFinite(phase) || phase < 0 || phase > 360) return false;
+      const gamma = sim.state.clutch.gamma;
+      let target = Math.floor((gamma + 1e-8) / 360) * 360 + phase;
+      if (target < gamma - 1e-8) target += 360;
+      if (target > gamma + 1e-8) {
+        if (action?.control === 'seek') action.target = target;
+        else start({ kind: 'crank', target, direction: 1, control: 'seek' });
+      } else if (action) {
+        pause();
+      }
+      return true;
+    },
     spool(degrees) {
+      if (controls284) return turnSpool(degrees > 0, Math.abs(degrees));
       if (!sim.state.drive.engaged) start({ kind: 'spool', left: Math.abs(degrees), direction: Math.sign(degrees) });
     },
+    turnSpool,
     reset() { pause(false); error = ''; sim.reset(); emit(); },
     pause,
   };
 }
 
 function mountOperationControls(root, transport, summary) {
+  const controls284 = transport.sim.controlsVersion === 284;
   const crankStep = transport.sim.passivePlate ? '0.1' : '1';
-  root.innerHTML = [
-    '<section data-operation-panel="278" aria-label="真实操作联动" style="display:grid;gap:8px">',
-    '<div><strong>按板</strong><div data-operation-actions><button data-operation="press" type="button">按板按下</button><button data-operation="lift" type="button">按板抬起</button></div></div>',
-    '<div><strong>摇臂</strong><small> · 外侧看逆时针</small><div data-operation-actions><button data-operation="crank" type="button">逆时针一步</button><button data-operation="wind" type="button">连续摇臂</button></div>',
+  const crankButtons = controls284 ?
+    '<button data-operation="recover" type="button">摇臂复位离合</button>' :
+    '<button data-operation="crank" type="button">逆时针一步</button>';
+  const crankSlider = controls284 ?
+    '<label data-operation-slider>摇臂角度 0–360° <input data-operation-size="crank" type="range" min="0" max="360" step="0.1" value="0"><output data-operation-angle="crank">0.0°</output></label><small>受止逆限制，回拖按正向跨圈到达。</small>' :
     '<label data-operation-slider>摇臂步长 <input data-operation-size="crank" type="range" min="' + crankStep +
-      '" max="180" step="' + crankStep + '" value="15"><output data-operation-angle="crank">15°</output></label></div>',
-    '<div><strong>线杯</strong><div data-operation-actions><button data-operation="spool-forward" type="button">线杯正转</button><button data-operation="spool-reverse" type="button">线杯反转</button></div>',
+    '" max="180" step="' + crankStep + '" value="15"><output data-operation-angle="crank">15°</output></label>';
+  root.innerHTML = [
+    '<section data-operation-panel="' + (controls284 ? '284' : '278') + '" aria-label="真实操作联动" style="display:grid;gap:8px">',
+    '<div><strong>按板</strong><div data-operation-actions><button data-operation="press" type="button">按板按下</button><button data-operation="lift" type="button">按板抬起</button></div></div>',
+    '<div><strong>摇臂</strong><small> · 外侧看逆时针</small><div data-operation-actions>' + crankButtons +
+      '<button data-operation="wind" type="button">连续摇臂</button></div>' + crankSlider + '</div>',
+    '<div><strong>线杯</strong>' + (controls284 ? '<small> · 正转为收线方向</small>' : '') +
+      '<div data-operation-actions><button data-operation="spool-forward" type="button">线杯正转</button><button data-operation="spool-reverse" type="button">线杯反转</button></div>',
     '<label data-operation-slider>线杯步长 <input data-operation-size="spool" type="range" min="1" max="720" step="1" value="15"><output data-operation-angle="spool">15°</output></label></div>',
     '<div data-operation-actions><button data-operation="pause" type="button">暂停</button><button data-operation="reset" type="button">恢复初始状态</button></div>',
     '<output data-operation-state aria-live="polite"></output><output data-operation-detail></output>',
     '</section>',
+    controls284 ? '<style>' +
+      '[data-operation-panel="284"] button{background:#eef7fa;color:#15495a;border-color:#9db5bf}' +
+      '[data-operation-panel="284"] button:not(:disabled):is(:active,[data-active="true"]){background:#145568;color:#fff;border-color:#145568}' +
+      '[data-operation-panel="284"] button:disabled{background:#e5e7eb;color:#6b7280;border-color:#cbd2d8;opacity:1;cursor:default}' +
+      '</style>' : '',
   ].join('');
   const panel = root.firstElementChild;
+  const document = root.ownerDocument, window = document.defaultView;
+  let dragPointer = null;
   const button = action => panel.querySelector('[data-operation="' + action + '"]');
   const input = kind => panel.querySelector('[data-operation-size="' + kind + '"]');
   const value = kind => Number(input(kind).value);
@@ -1587,30 +1790,49 @@ function mountOperationControls(root, transport, summary) {
     group.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:3px';
   }
   for (const label of panel.querySelectorAll('[data-operation-slider]')) {
-    label.style.cssText = 'display:grid;grid-template-columns:auto minmax(55px,1fr) 3em;align-items:center;gap:6px';
+    label.style.cssText = 'display:grid;grid-template-columns:auto minmax(55px,1fr) ' +
+      (controls284 ? '4em' : '3em') + ';align-items:center;gap:6px';
   }
   for (const action of panel.querySelectorAll('button')) {
-    action.style.cssText = 'padding:3px 8px;border:1px solid currentColor;border-radius:4px';
+    action.style.cssText = 'padding:3px 8px;border-width:1px;border-style:solid;border-radius:4px' +
+      (controls284 ? '' : ';border-color:currentColor');
   }
   const actions = {
     press: () => transport.plate(true),
     lift: () => transport.plate(false),
-    crank: () => transport.crank(value('crank')),
+    ...(controls284 ? { recover: () => transport.recoverClutch() } : { crank: () => transport.crank(value('crank')) }),
     wind: () => transport.crank(),
-    'spool-forward': () => transport.spool(value('spool')),
-    'spool-reverse': () => transport.spool(-value('spool')),
+    'spool-forward': () => controls284 ? transport.turnSpool(true, value('spool')) : transport.spool(value('spool')),
+    'spool-reverse': () => controls284 ? transport.turnSpool(false, value('spool')) : transport.spool(-value('spool')),
     pause: () => transport.pause(),
     reset: () => transport.reset(),
   };
   for (const [id, run] of Object.entries(actions)) button(id).onclick = run;
-  for (const kind of ['crank', 'spool']) input(kind).oninput = () => {
+  for (const kind of controls284 ? ['spool'] : ['crank', 'spool']) input(kind).oninput = () => {
     panel.querySelector('[data-operation-angle="' + kind + '"]').textContent = value(kind) + '°';
   };
   const stateLine = panel.querySelector('[data-operation-state]'), detail = panel.querySelector('[data-operation-detail]');
   const refresh = () => {
     const state = summary(transport.sim), { clutch, drive } = transport.sim.state;
     button('pause').disabled = !transport.action;
-    button('spool-forward').disabled = button('spool-reverse').disabled = drive.engaged || drive.inserting;
+    if (controls284) {
+      button('recover').disabled = transport.sim.clutchIsReset();
+      button('spool-reverse').disabled = !transport.sim.canReverseSpool();
+      const phase = state.phase > 360 - 1e-8 ? 0 : state.phase;
+      if (dragPointer === null) input('crank').value = String(phase);
+      panel.querySelector('[data-operation-angle="crank"]').textContent = phase.toFixed(1) + '°';
+      const selected = transport.activeControl;
+      const plateMoving = selected === 'press' || selected === 'lift';
+      for (const control of panel.querySelectorAll('button')) {
+        const name = control.dataset.operation;
+        const plateHeld = !plateMoving && ((name === 'press' && clutch.highPlatform) ||
+          (name === 'lift' && clutch.event === 'low-stop'));
+        const active = String(name === selected || plateHeld);
+        if (control.dataset.active !== active) control.dataset.active = active;
+      }
+    } else {
+      button('spool-forward').disabled = button('spool-reverse').disabled = drive.engaged || drive.inserting;
+    }
     const action = transport.sim.state.action;
     const held = state.blocked && !clutch.highPlatform && (action === 'plate' ? '按板停在当前接触位置' :
       action === 'crank' ? '摇臂停在当前接触位置' : '');
@@ -1639,12 +1861,40 @@ function mountOperationControls(root, transport, summary) {
     panel.dataset.highPlatform = String(Boolean(clutch.highPlatform));
     panel.dataset.action = transport.action;
   };
+  const finishDrag = event => {
+    if (event.pointerId !== dragPointer) return;
+    dragPointer = null;
+    if (event.type === 'pointercancel') transport.pause();
+    else refresh();
+  };
+  if (controls284) {
+    const crankInput = input('crank');
+    crankInput.onpointerdown = event => {
+      dragPointer = event.pointerId;
+      transport.pause();
+    };
+    crankInput.oninput = () => {
+      transport.seekCrankPhase(Number(crankInput.value));
+      refresh();
+    };
+    window.addEventListener('pointerup', finishDrag);
+    window.addEventListener('pointercancel', finishDrag);
+  }
   const unsubscribe = transport.subscribe(refresh);
-  const document = root.ownerDocument;
-  const pauseWhenHidden = () => { if (document.hidden && transport.action) transport.pause(); };
+  const pauseWhenHidden = () => {
+    if (!document.hidden) return;
+    const dragging = dragPointer !== null;
+    dragPointer = null;
+    if (transport.action) transport.pause();
+    else if (dragging) refresh();
+  };
   document.addEventListener('visibilitychange', pauseWhenHidden);
   refresh();
   return () => {
+    if (controls284) {
+      window.removeEventListener('pointerup', finishDrag);
+      window.removeEventListener('pointercancel', finishDrag);
+    }
     document.removeEventListener('visibilitychange', pauseWhenHidden);
     unsubscribe();
     root.replaceChildren();
@@ -1856,7 +2106,7 @@ function operationMesh278(data, sim) {
 function setupOperation278(data) {
   clearOperation278();
   if (!data) return;
-  const sim = opState.createOperationState(data, opContact.makeClutchContact(data.contact), opCoupling);
+  const sim = opState.createOperationState(data, opContact.makeClutchContact(data.contact), opCoupling, opTorsion284);
   const transport = opControls.createOperationTransport(sim);
   const mesh = operationMesh278(data, sim);
   const update = transport.subscribe(() => {
