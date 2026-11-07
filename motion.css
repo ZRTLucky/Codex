@@ -2,3 +2,7 @@
 .remember-choice{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px}.remember-choice input{width:auto;margin:0;accent-color:#146578}#forget-device{font-size:12px;padding:7px 12px}
 
 #sequence270{border:1px solid #667;padding:12px;border-radius:8px}#sequence270-progress{width:100%;margin:10px 0}#sequence270-stage{display:block}#sequence270-blocked{color:#b76b15}
+
+#download-retry{background:#eef7fa;color:#15495a;border-color:#9db5bf}
+#download-retry:active:not(:disabled){background:#145568;color:#fff;border-color:#145568}
+#download-retry:disabled{background:#e5e7eb;color:#6b7280;border-color:#cbd2d8;opacity:1;cursor:default}

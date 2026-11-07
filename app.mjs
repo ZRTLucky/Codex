@@ -338,6 +338,7 @@ function createOperationState(data, contact, coupling, torsion) {
   const baselineSpring = centerline(contactOrigin, datum);
   const baselineFlexKey = contactOrigin.q + ':' + contactOrigin.phi;
   const compressionSprings = data.compressionSprings || [];
+  const yokeSpringPack = data.contact?.yokeSpringPack;
   const pressQ = data.pressQ ?? -27;
   const plateStopTolerance = 1e-6;
   const plateRate = 60;
@@ -348,8 +349,17 @@ function createOperationState(data, contact, coupling, torsion) {
   let lastFlex = null, poseState = null, cachedPose = null;
   let compressionLift, compressed = [];
 
+  function withSpringLoad(drive) {
+    if (!yokeSpringPack || !drive.yokeSupport) return drive;
+    const { count, rateEach, lowCompression } = yokeSpringPack;
+    const yokeSpringForceN = count * rateEach * (lowCompression + drive.yokeLift);
+    const pinionSpringForceN = drive.yokeSupport === 'pinion-clip' ? yokeSpringForceN :
+      drive.yokeSupport.endsWith('-and-clip') ? null : 0;
+    return { ...drive, yokeSpringForceN, pinionSpringForceN };
+  }
+
   function reset() {
-    state = { clutch: contactOrigin, drive: coupling.initialCoupling(0, 0), action: 'reset' };
+    state = { clutch: contactOrigin, drive: withSpringLoad(coupling.initialCoupling(0, 0)), action: 'reset' };
     return state;
   }
 
@@ -391,33 +401,17 @@ function createOperationState(data, contact, coupling, torsion) {
   }
 
   function advancePassivePlate(target) {
-    let { clutch, drive } = state;
-    const startGamma = clutch.gamma, direction = Math.sign(target - clutch.q);
-    const steps = [], leadInSteps = [];
-    let passiveSpoolDeltaDeg = 0;
-    while (direction * (target - clutch.q) > 1e-8) {
-      // Complete absolute tenths of a degree before publishing a new mechanical state.
-      const scaled = clutch.q * 10;
-      const tick = direction < 0 ? Math.ceil(scaled - 1e-7) - 1 : Math.floor(scaled + 1e-7) + 1;
-      const q = tick / 10;
-      if (direction * (q - target) > 1e-8) break;
-      const next = contact.advanceFreePlate(clutch, q);
-      validatePlateTrace(clutch, next);
-      const travel = 20 * Math.abs(next.q - clutch.q) / plateRate;
-      drive = coupling.advanceCoupling(drive, clutch, next, 0, travel);
-      passiveSpoolDeltaDeg += drive.passiveSpoolDeltaDeg || 0;
-      leadInSteps.push(...(drive.leadInSteps || []));
-      steps.push(...next.steps);
-      const progressed = Math.abs(next.q - clutch.q) > 1e-8;
-      clutch = next;
-      if (next.blocked || !progressed) break;
-    }
-    if (clutch !== state.clutch) {
-      state = {
-        clutch: { ...clutch, steps, passiveMainDeltaDeg: clutch.gamma - startGamma },
-        drive: { ...drive, passiveSpoolDeltaDeg, leadInSteps }, action: 'plate',
-      };
-    }
+    const { clutch, drive } = state;
+    const direction = Math.sign(target - clutch.q);
+    const tick = direction < 0 ? Math.ceil(target * 10 - 1e-7) : Math.floor(target * 10 + 1e-7);
+    const q = tick / 10;
+    if (direction * (q - clutch.q) <= 1e-8) return state;
+    // One solve publishes all completed tenths, with each original contact interval still evaluated.
+    const next = contact.advanceFreePlate(clutch, q, { snapTenths: true, holdMain: direction > 0 });
+    validatePlateTrace(clutch, next);
+    const travel = 20 * Math.abs(next.q - clutch.q) / plateRate;
+    const nextDrive = coupling.advanceCoupling(drive, clutch, next, 0, travel);
+    state = { clutch: next, drive: withSpringLoad(nextDrive), action: 'plate' };
     return state;
   }
 
@@ -458,7 +452,7 @@ function createOperationState(data, contact, coupling, torsion) {
     }
     const couplingFrom = after === before ? { ...before, steps: [] } : after;
     drive ||= coupling.advanceCoupling(previousDrive, before, couplingFrom, spoolDelta, seatStepMm);
-    state = { clutch: after, drive, action: kind };
+    state = { clutch: after, drive: withSpringLoad(drive), action: kind };
     return state;
   }
 
@@ -545,12 +539,17 @@ function createOperationState(data, contact, coupling, torsion) {
 function operationSummary(sim) {
   const { clutch, drive } = sim.state;
   const { wormAngle, flip } = sim.pose();
-  const coupling = drive.awaitAxialThrust ? '销槽已对合，待正向摇臂完成落座' :
-    drive.inserting ? '销槽已对合，正在落座' : drive.leadInSpring ? '压簧沿导入斜面拨动线杯' :
-      drive.engaged ? '线杯已接合' : drive.dogContact === 'lead-in' ? '销进入导入斜面，等待落座' :
-        drive.waiting ? '等待线杯销槽对合' : '线杯可独立转动';
+  const fullyEngaged = drive.engaged && drive.dogContact === 'seated' && drive.pinionLift <= 1e-6;
+  const coupling = fullyEngaged ? '线杯已完全啮合' :
+    drive.awaitAxialThrust ? '待完全啮合 · 销槽已对合，正向摇臂完成落座' :
+    drive.inserting ? '待完全啮合 · 销槽已对合，正在轴向落座' :
+    drive.leadInSpring ? '待完全啮合 · 压簧沿导入斜面拨动线杯' :
+    drive.dogContact === 'lead-in' ? '待完全啮合 · 销进入导入斜面' :
+    drive.waiting && drive.yokeSupport === 'pinion-clip' ? '待完全啮合 · 压簧经托架压住小齿卡簧，销抵入口' :
+    sim.canReverseSpool() ? '线杯可独立转动' : '待完全啮合 · 小齿向销槽靠近';
   return {
     coupling,
+    fullyEngaged,
     phase: spinPhase(clutch.gamma),
     gamma: clutch.gamma,
     spool: spinPhase(drive.spoolDeg),
@@ -561,6 +560,10 @@ function operationSummary(sim) {
     flip,
     lift: drive.pinionLift,
     yoke: drive.yokeLift,
+    yokeSupport: drive.yokeSupport,
+    pinionClipGapMm: drive.pinionClipGapMm,
+    yokeSpringForceN: drive.yokeSpringForceN,
+    pinionSpringForceN: drive.pinionSpringForceN,
     event: typeof clutch.event === 'string' ? clutch.event : clutch.event?.label,
     blocked: clutch.blocked,
   };
@@ -624,8 +627,10 @@ function straddles(a, b, c, d) {
 }
 
 function overlap(points, gear, localEdges) {
+  if (points.some(gear.inside)) return true;
+  if (!localEdges.length) return false;
   const headEdges = edges(points);
-  return points.some(gear.inside) || localEdges.some(([a, b]) =>
+  return localEdges.some(([a, b]) =>
     inside(a, headEdges) || inside(b, headEdges) || headEdges.some(([c, d]) =>
       straddles(a, b, c, d) && straddles(c, d, a, b)));
 }
@@ -660,10 +665,14 @@ function overlapArea(points, gear, stopAt = Infinity) {
   return area;
 }
 
-function circleHits(a, b, radius2, hit) {
+function circleLine(a, b) {
   const v = sub(b, a), aa = dot(v, v);
+  return { a, v, aa, bb: dot(a, v), origin2: dot(a, a) };
+}
+
+function circleHits({ a, v, aa, bb, origin2 }, radius2, hit) {
   if (aa < EPS ** 2) return;
-  const bb = dot(a, v), discriminant = bb * bb - aa * (dot(a, a) - radius2);
+  const discriminant = bb * bb - aa * (origin2 - radius2);
   if (discriminant < -EPS) return;
   const root = Math.sqrt(Math.max(0, discriminant));
   for (const t of [(-bb - root) / aa, (-bb + root) / aa]) {
@@ -694,18 +703,41 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
   const { fixedHole, armA, armB, radiusFree, alphaFree, turnsFree, k } = data.spring;
   const yokePack = data.yokeSpringPack;
   const footR = norm(foot), footA = angle(foot), headEdges = edges(head);
+  const headPolar = head.map(v => [dot(v, v), angle(v)]);
+  const headEdgeLines = headEdges.map(([a, b]) => circleLine(a, b));
   const headR = Math.max(...head.map(norm));
   const discVectors = outline.map(p => sub(p, disc));
   const polarStart = angle(discVectors[0]);
   const polar = discVectors.map(p => mod(polarStart - angle(p), 2 * Math.PI));
   if (polar.some((v, i) => i && v <= polar[i - 1])) throw new Error('Reset outline must be clockwise and star-shaped about its axle.');
   const discRadii = discVectors.map(norm), discOuter = Math.max(...discRadii), discRoot = Math.min(...discRadii);
+  const gearBins = Array.from({ length: 16 }, () => []);
+  const binFor = x => clamp(Math.floor((x / discOuter + 1) * gearBins.length / 2), 0, gearBins.length - 1);
+  const localEdgeBounds = [];
+  for (let index = 0; index < discVectors.length; index++) {
+    const [x, y] = discVectors[index], [nextX, nextY] = discVectors[(index + 1) % discVectors.length];
+    const minX = Math.min(x, nextX), maxX = Math.max(x, nextX);
+    localEdgeBounds.push([minX, Math.min(y, nextY), maxX, Math.max(y, nextY)]);
+    const first = binFor(minX - EPS), last = binFor(maxX + EPS);
+    for (let bin = first; bin <= last; bin++) gearBins[bin].push(index);
+  }
+  const gearBinRanges = gearBins.map((_, first) => {
+    const indices = new Set();
+    return gearBins.map((bin, last) => {
+      if (last < first) return [];
+      for (const index of bin) indices.add(index);
+      return [...indices].sort((a, b) => a - b);
+    });
+  });
   const rootArcs = discRadii.map((r, i) => r < discRoot + 2e-7 && discRadii[(i + 1) % discRadii.length] < discRoot + 2e-7);
   const headSense = Math.sign(headEdges.reduce((area, [a, b]) => area + cross(a, b), 0));
   const pivot = q => add(cam, rotate(pivotLowRelative, q * RAD));
   const sleeve = (p, phi) => add(p, rotate(foot, phi * RAD));
   const old = ([x, y]) => [y - cam[1], cam[0] - x];
-  const headAt = (p, phi) => head.map(v => add(p, rotate(v, phi * RAD)));
+  const headAt = (p, phi) => {
+    const c = Math.cos(phi * RAD), s = Math.sin(phi * RAD);
+    return head.map(([x, y]) => [p[0] + (c * x - s * y), p[1] + (s * x + c * y)]);
+  };
   const radius = a => radiusFree * turnsFree / (turnsFree + (alphaFree - a) / (2 * Math.PI));
   const span = a => {
     const c = Math.cos(a / 2), s = Math.sin(a / 2);
@@ -754,9 +786,37 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     return .5 * yokePack.count * yokePack.rateEach * (compression ** 2 - yokePack.lowCompression ** 2);
   }
 
+  const gearCache = new Map();
   function gearAt(gamma) {
-    const phi = mod(gamma, 360) * RAD, c = Math.cos(phi), s = Math.sin(phi);
-    const points = discVectors.map(([x, y]) => [disc[0] + c * x - s * y, disc[1] + s * x + c * y]);
+    const degrees = mod(gamma, 360);
+    if (gearCache.has(degrees)) return gearCache.get(degrees);
+    const phi = degrees * RAD, c = Math.cos(phi), s = Math.sin(phi);
+    const points = new Array(discVectors.length), worldEdges = new Array(discVectors.length);
+    const pointAt = i => {
+      if (!points[i]) {
+        const [x, y] = discVectors[i];
+        points[i] = [disc[0] + c * x - s * y, disc[1] + s * x + c * y];
+      }
+      return points[i];
+    };
+    const edgeAt = i => worldEdges[i] ??= [pointAt(i), pointAt((i + 1) % discVectors.length), i];
+    const near = box => {
+      const x0 = box[0] - disc[0], y0 = box[1] - disc[1], x1 = box[2] - disc[0], y1 = box[3] - disc[1];
+      const minX = Math.min(c * x0, c * x1) + Math.min(s * y0, s * y1) - EPS;
+      const maxX = Math.max(c * x0, c * x1) + Math.max(s * y0, s * y1) + EPS;
+      if (minX > discOuter || maxX < -discOuter) return [];
+      const minY = Math.min(-s * x0, -s * x1) + Math.min(c * y0, c * y1) - EPS;
+      const maxY = Math.max(-s * x0, -s * x1) + Math.max(c * y0, c * y1) + EPS;
+      // Transform the query bounds into the fixed profile bins, then do the same exact world-box test.
+      const result = [];
+      for (const i of gearBinRanges[binFor(minX)][binFor(maxX)]) {
+        const [edgeMinX, edgeMinY, edgeMaxX, edgeMaxY] = localEdgeBounds[i];
+        if (edgeMaxX < minX || edgeMinX > maxX || edgeMaxY < minY || edgeMinY > maxY) continue;
+        const edge = edgeAt(i);
+        if (edgeHitsBox(edge, box)) result.push(edge);
+      }
+      return result;
+    };
     const pointInside = p => {
       const v = sub(p, disc), r = norm(v);
       if (r > discOuter) return false;
@@ -772,15 +832,22 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
       const a = discVectors[i], b = discVectors[j % polar.length];
       return cross(a, b) / cross(u, sub(b, a)) > 1 + 1e-11;
     };
-    return { edges: edges(points), inside: pointInside, center: disc };
+    let allEdges;
+    const gear = { get edges() { return allEdges ??= discVectors.map((_, i) => edgeAt(i)); },
+      near, inside: pointInside, center: disc };
+    if (gearCache.size >= 32) gearCache.delete(gearCache.keys().next().value);
+    gearCache.set(degrees, gear);
+    return gear;
   }
 
-  function stopGaps(p, phi) {
+  function fitsStops(p, phi) {
     const c = sleeve(p, phi);
-    return data.shoulders.map(({ endpoint, normal, arc, relief }) => [
-      Math.max(dot(sub(c, endpoint), normal), relief ? dot(sub(c, relief.endpoint), relief.normal) : -Infinity),
-      arc.sign * (norm(sub(c, arc.pivot)) - footR),
-    ]);
+    for (const { endpoint, normal, arc, relief } of data.shoulders) {
+      if (dot(sub(c, endpoint), normal) < -EPS &&
+          (!relief || dot(sub(c, relief.endpoint), relief.normal) < -EPS)) return false;
+      if (arc.sign * (norm(sub(c, arc.pivot)) - footR) < -EPS) return false;
+    }
+    return true;
   }
 
   function finiteClearance(p, phi) {
@@ -806,7 +873,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
   function intervals(p, gear, lo, hi) {
     const candidates = [lo, hi], pad = headR * ((hi - lo) * RAD) ** 2 / 8 + 1e-8;
     const limits = bounds([...headAt(p, lo), ...headAt(p, hi)], pad);
-    const local = gear.edges.filter(e => edgeHitsBox(e, limits));
+    const local = gear.near(limits);
     const addAngle = a => {
       const t = mod(a / RAD + 180, 360) - 180;
       if (t > lo && t < hi) candidates.push(t);
@@ -817,12 +884,16 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
         addAngle(a - b); addAngle(a + b);
       }
     };
+    const vertices = new Set();
     for (const [wa, wb] of local) {
-      const a = sub(wa, p), b = sub(wb, p);
-      for (const v of head) circleHits(a, b, dot(v, v), z => addAngle(angle(z) - angle(v)));
-      for (const v of [a, b]) {
-        for (const [u, w] of headEdges) circleHits(u, w, dot(v, v), z => addAngle(angle(v) - angle(z)));
-      }
+      const line = circleLine(sub(wa, p), sub(wb, p));
+      for (const [radius2, bearing] of headPolar) circleHits(line, radius2, z => addAngle(angle(z) - bearing));
+      vertices.add(wa);
+      vertices.add(wb);
+    }
+    for (const vertex of vertices) {
+      const v = sub(vertex, p), radius2 = dot(v, v), bearing = angle(v);
+      for (const line of headEdgeLines) circleHits(line, radius2, z => addAngle(bearing - angle(z)));
     }
     for (const { endpoint, normal, arc, relief } of data.shoulders) {
       around(angle(normal) - footA, dot(sub(endpoint, p), normal) / footR);
@@ -834,7 +905,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     const feasible = [];
     for (let i = 1; i < candidates.length; i++) {
       const a = candidates[i - 1], b = candidates[i], phi = (a + b) / 2;
-      if (b - a < 1e-9 || stopGaps(p, phi).flat().some(gap => gap < -EPS) || overlap(headAt(p, phi), gear, local)) continue;
+      if (b - a < 1e-9 || !fitsStops(p, phi) || overlap(headAt(p, phi), gear, local)) continue;
       if (feasible.length && Math.abs(feasible.at(-1)[1] - a) < 1e-8) feasible.at(-1)[1] = b;
       else feasible.push([a, b]);
     }
@@ -859,7 +930,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
       if (Math.min(...finiteClearance(p, phi)) < -1e-5) return false;
       const gear = heldGear ?? gearAt(before.gamma + t * (after.gamma - before.gamma));
       const points = headAt(p, phi), box = bounds(points);
-      const local = gear.edges.filter(e => edgeHitsBox(e, box));
+      const local = gear.near(box);
       if (overlap(points, gear, local) && overlapArea(points, gear, 2e-5) >= 2e-5) return false;
     }
     return true;
@@ -871,7 +942,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
 
   function pose(q, phi, gamma, steps = [], blocked = null) {
     const p = pivot(q), gear = gearAt(gamma), points = headAt(p, phi), box = bounds(points, .005);
-    const near = gear.edges.filter(e => edgeHitsBox(e, box));
+    const near = gear.near(box);
     const toothGap = Math.min(Infinity, ...near.flatMap(e => points.map(v => distanceToEdge(v, e))),
       ...edges(points).flatMap(e => near.flatMap(([a, b]) => [distanceToEdge(a, e), distanceToEdge(b, e)])));
     const contact = toothGap < .001;
@@ -926,7 +997,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     return pose(q, phi, gamma, steps);
   }
 
-  const clearGear = { edges: [], inside: () => false, center: disc };
+  const clearGear = { near: () => [], inside: () => false, center: disc };
 
   function positiveGearContact(p, phi, gear) {
     const gap = .0002, momentArm = .02;
@@ -939,8 +1010,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
       const force = scale([-d[1], d[0]], sense / length);
       return cross(sub(gearVertex ? vertex : location, disc), force) > momentArm;
     }
-    return gear.edges.some(([a, b], i) => {
-      if (!edgeHitsBox([a, b], box)) return false;
+    return gear.near(box).some(([a, b, i]) => {
       // The exact root is a concentric cylinder. Chords in its sampled outline cannot supply shaft torque.
       if (!rootArcs[i] && points.some(v => positiveContact(v, a, b, -1, false))) return true;
       if (rootArcs[i] && rootArcs[(i + rootArcs.length - 1) % rootArcs.length]) return false;
@@ -948,14 +1018,18 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     });
   }
 
-  function freePlateStep(state, q, weight, shaftDrag, phiWidth) {
+  function freePlateStep(state, q, weight, shaftDrag, phiWidth, holdMain) {
     const p = pivot(q), { phi, gamma } = state;
     const pawlCost = t => energy(p, t) + weight * ((t - phi) * RAD) ** 2;
-    const unconstrained = best(p, clearGear, phi, phiWidth, pawlCost);
     const currentGear = gearAt(gamma);
+    const fixed = { q, gamma, ...best(p, currentGear, phi, phiWidth, pawlCost) };
+    if (holdMain) return fixed;
+    const unconstrained = best(p, clearGear, phi, phiWidth, pawlCost);
+    if (Number.isFinite(fixed.score) && fixed.score <= unconstrained.score + 1e-11) return fixed;
     let canDrive;
     const at = t => {
-      const gear = t === gamma ? currentGear : gearAt(t);
+      if (t === gamma) return fixed;
+      const gear = gearAt(t);
       const opt = best(p, gear, phi, phiWidth, pawlCost);
       const rotation = (t - gamma) * RAD;
       if (rotation > EPS && Number.isFinite(opt.score)) {
@@ -964,9 +1038,6 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
       }
       return { q, phi: opt.phi, gamma: t, score: opt.score + weight * rotation ** 2 + shaftDrag * rotation };
     };
-    const fixed = at(gamma);
-    if (Number.isFinite(fixed.score) && fixed.score <= unconstrained.score + 1e-11) return fixed;
-
     const tested = [fixed, ...Array.from({ length: 8 }, (_, i) => at(gamma + (i + 1) * .03))];
     let j = 0;
     for (let i = 1; i < tested.length; i++) if (tested[i].score < tested[j].score - 1e-11) j = i;
@@ -976,7 +1047,7 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     return refined.score < tested[j].score - 1e-11 ? refined : tested[j];
   }
 
-  function advanceFreePlate(state, targetQ, { shaftDragNmm = 0 } = {}) {
+  function advanceFreePlate(state, targetQ, { shaftDragNmm = 0, snapTenths = false, holdMain = false } = {}) {
     if (!Number.isFinite(targetQ) || !Number.isFinite(shaftDragNmm) || shaftDragNmm < 0) throw new TypeError('Finite plate target and nonnegative shaft drag required.');
     targetQ = camTarget(targetQ);
     let current = { q: state.q, phi: state.phi, gamma: state.gamma };
@@ -990,33 +1061,41 @@ function makeClutchContact(data, { plateRateDegPerSec = 5 } = {}) {
     }
 
     function relaxAtFixedCam() {
-      const next = freePlateStep(current, current.q, 1.25, shaftDragNmm, .24);
+      const next = freePlateStep(current, current.q, 1.25, shaftDragNmm, .24, holdMain);
       const previousEnergy = energy(pivot(current.q), current.phi);
       if (next.score >= previousEnergy - 1e-10 || !acceptableSegment(current, next)) return false;
       accept(next);
       return true;
     }
 
-    while (Math.abs(targetQ - current.q) > 1e-9 && steps.length < 4000) {
-      const sign = Math.sign(targetQ - current.q);
-      let ds = Math.min(.1, Math.abs(targetQ - current.q)), next;
-      const minStep = Math.min(1e-5, ds / 2);
-      while (ds >= minStep) {
-        next = freePlateStep(current, current.q + sign * ds, .025 * plateRateDegPerSec / ds, shaftDragNmm, 2);
-        if (Number.isFinite(next.score) && Math.abs(next.phi - current.phi) <= .25 && acceptableSegment(current, next)) break;
-        ds /= 2;
+    let waypoint;
+    do {
+      const scaled = current.q * 10;
+      waypoint = !snapTenths || current.q === targetQ ? targetQ : targetQ < current.q ?
+        Math.max(targetQ, (Math.ceil(scaled - 1e-7) - 1) / 10) :
+        Math.min(targetQ, (Math.floor(scaled + 1e-7) + 1) / 10);
+      const budget = steps.length + 4000;
+      while (Math.abs(waypoint - current.q) > 1e-9 && steps.length < budget) {
+        const sign = Math.sign(waypoint - current.q);
+        let ds = Math.min(.1, Math.abs(waypoint - current.q)), next;
+        const minStep = Math.min(1e-5, ds / 2);
+        while (ds >= minStep) {
+          next = freePlateStep(current, current.q + sign * ds, .025 * plateRateDegPerSec / ds, shaftDragNmm, 2, holdMain);
+          if (Number.isFinite(next.score) && Math.abs(next.phi - current.phi) <= .25 && acceptableSegment(current, next)) break;
+          ds /= 2;
+        }
+        if (ds < minStep) {
+          if (relaxAtFixedCam()) continue;
+          return finish('plate-contact');
+        }
+        accept(next);
       }
-      if (ds < minStep) {
-        if (relaxAtFixedCam()) continue;
-        return finish('plate-contact');
+      if (Math.abs(waypoint - current.q) > 1e-8) return finish('plate-step-budget');
+      if (current.q !== waypoint) accept({ ...current, q: waypoint });
+      if (current.q === LOW || current.q === HIGH) {
+        for (let i = 0; i < 400; i++) if (!relaxAtFixedCam()) break;
       }
-      accept(next);
-    }
-    if (Math.abs(targetQ - current.q) > 1e-8) return finish('plate-step-budget');
-    if (current.q !== targetQ) accept({ ...current, q: targetQ });
-    if (current.q === LOW || current.q === HIGH) {
-      for (let i = 0; i < 400; i++) if (!relaxAtFixedCam()) break;
-    }
+    } while (waypoint !== targetQ);
     return finish(null);
   }
 
@@ -1387,6 +1466,16 @@ function springGoal(q, prior) {
   return Math.max(nominal, Math.min(prior, yokeLift(q) + YOKE_CLIP_FREE_RISE_MM));
 }
 
+function supportedYoke(q, pinionLift) {
+  const camLift = yokeLift(q);
+  const actual = Math.max(camLift, pinionLift - YOKE_CLIP_FREE_RISE_MM);
+  const pinionClipGapMm = Math.max(0, actual + YOKE_CLIP_FREE_RISE_MM - pinionLift);
+  const camSupport = camLift > EPS ? 'cam' : 'lower-stop';
+  const yokeSupport = actual > camLift + EPS ? 'pinion-clip' :
+    pinionClipGapMm <= EPS ? camSupport + '-and-clip' : camSupport;
+  return { yokeLift: actual, yokeSupport, pinionClipGapMm };
+}
+
 function yokeFloorAt(coupling, gamma) {
   if (!coupling || coupling.engaged) return 0;
   const previousBase = coupling.spoolDeg - coupling.pinionDeg + HELIX_DEG_PER_MM * coupling.pinionLift;
@@ -1399,7 +1488,7 @@ function yokeFloorAt(coupling, gamma) {
 function initialCoupling(gamma = 0, q = 0) {
   const lift = nominalPinionLift(q), engaged = q > Q_CLEAR;
   return {
-    pinionLift: lift, yokeLift: yokeLift(q), pinionDeg: angle(gamma, lift),
+    pinionLift: lift, ...supportedYoke(q, lift), pinionDeg: angle(gamma, lift),
     spoolDeg: angle(gamma, engaged ? lift : CLEAR_LIFT_MM), engaged, inserting: false, waiting: false,
     dogContact: engaged ? 'seated' : 'free', awaitAxialThrust: false, pickup: null,
   };
@@ -1499,7 +1588,7 @@ function advanceCoupling(prev, fromClutch, toClutch, spoolDeltaDeg = 0, seatStep
       current.pinionDeg = after.pinionDeg;
       current.pinionLift = after.lift;
       current.inserting = current.awaitAxialThrust = false;
-      current.waiting = after.lift > nominalPinionLift(b.q) + EPS;
+      current.waiting = after.contact;
       current.dogContact = after.contact ? (after.lift >= CLEAR_LIFT_MM - .002 ? 'flat' : 'lead-in') : 'free';
       current.leadInSpring = false;
       if (!holdSpoolOnNose && Math.abs(manual) <= EPS && after.contact) moveSpoolDownNose(b, seat, !plateInput && b.gamma > a.gamma + EPS);
@@ -1527,7 +1616,8 @@ function advanceCoupling(prev, fromClutch, toClutch, spoolDeltaDeg = 0, seatStep
     const below = a.q > Q_CLEAR || b.q > Q_CLEAR;
     if (!below) {
       current.spoolDeg += manual;
-      current.pinionLift = nominalPinionLift(b.q);
+      // On the downstroke the tray takes up the clip gap before it can push the pinion.
+      current.pinionLift = springGoal(b.q, current.pinionLift);
       current.pinionDeg = angle(b.gamma, current.pinionLift);
       current.engaged = current.inserting = current.waiting = current.awaitAxialThrust = false;
       current.leadInSpring = false;
@@ -1543,6 +1633,10 @@ function advanceCoupling(prev, fromClutch, toClutch, spoolDeltaDeg = 0, seatStep
     const count = Math.max(1, Math.ceil(travel / .25), Math.ceil(Math.abs(b.q - a.q) / .2));
     for (let i = 0; i < count; i++) {
       const from = mixPose(a, b, i / count), to = mixPose(a, b, (i + 1) / count);
+      if (current.engaged && a.q === b.q) {
+        moveLatched(from, b, seat * (count - i) / count);
+        break;
+      }
       if (current.engaged) moveLatched(from, to, seat / count);
       else moveFree(from, to, manual / count, seat / count);
     }
@@ -1557,7 +1651,7 @@ function advanceCoupling(prev, fromClutch, toClutch, spoolDeltaDeg = 0, seatStep
       segment(split, to, share * (1 - t), seat * (1 - t));
     } else segment(from, to, share, seat);
   }
-  current.yokeLift = Math.max(yokeLift(toClutch.q), current.pinionLift - YOKE_CLIP_FREE_RISE_MM);
+  Object.assign(current, supportedYoke(toClutch.q, current.pinionLift));
   return current;
 }
 
@@ -1589,11 +1683,14 @@ return { initialCoupling, advanceCoupling, advanceCoupledCrank: typeof advanceCo
 
 const opControls = (() => {
 
+const crankTurnStart = gamma => Math.floor((gamma + 1e-8) / 360) * 360;
+
 function createOperationTransport(sim, scheduler = globalThis) {
   const subscribers = new Set();
   let action = null, frame = 0, last = null, error = '';
   let maxSpoolAdvanceMs = 0;
-  const controls284 = sim.controlsVersion === 284;
+  const directCrank = sim.controlsVersion === 287;
+  const phaseControls = sim.controlsVersion === 284 || directCrank;
   const emit = () => { for (const notify of subscribers) notify(); };
   const rates = { plate: sim.plateRate || 60, crank: 90, spool: 150 };
   const recoveryStep = 0.25;
@@ -1616,7 +1713,7 @@ function createOperationTransport(sim, scheduler = globalThis) {
       if (current.kind === 'plate') {
         const q = before.clutch.q;
         if (sim.passivePlate) {
-          current.progress += rates.plate * dt;
+          current.progress += rates.plate * (directCrank ? Math.min(dt, .2) : dt);
           const target = current.progress >= current.distance ? current.target : current.start + current.direction * current.progress;
           sim.advance('plate', target, dt);
           const reached = Math.abs(sim.state.clutch.q - current.target) <= sim.plateStopTolerance;
@@ -1706,7 +1803,7 @@ function createOperationTransport(sim, scheduler = globalThis) {
     frame = scheduler.requestAnimationFrame(tick);
   }
   function turnSpool(winding, degrees) {
-    if (!controls284 || !Number.isFinite(degrees) || degrees <= 0 || (!winding && !sim.canReverseSpool())) return false;
+    if (!phaseControls || !Number.isFinite(degrees) || degrees <= 0 || (!winding && !sim.canReverseSpool())) return false;
     start({ kind: 'cup', control: winding ? 'spool-forward' : 'spool-reverse', winding, left: degrees });
     return true;
   }
@@ -1726,14 +1823,27 @@ function createOperationTransport(sim, scheduler = globalThis) {
       if (degrees > 0) start({ kind: 'crank', left: degrees, direction: 1, control: degrees === Infinity ? 'wind' : 'crank' });
     },
     recoverClutch() {
-      if (!controls284 || sim.clutchIsReset()) return false;
+      if (!phaseControls || sim.clutchIsReset()) return false;
       start({ kind: 'recover', control: 'recover', pending: 0, startGamma: sim.state.clutch.gamma });
       return true;
     },
-    seekCrankPhase(phase) {
-      if (!controls284 || !Number.isFinite(phase) || phase < 0 || phase > 360) return false;
+    seekCrankPhase(phase, turnStart) {
+      if (!phaseControls || !Number.isFinite(phase) || phase < 0 || phase > 360) return false;
       const gamma = sim.state.clutch.gamma;
-      let target = Math.floor((gamma + 1e-8) / 360) * 360 + phase;
+      let target = (turnStart ?? crankTurnStart(gamma)) + phase;
+      if (directCrank) {
+        if (!Number.isFinite(target) || target > gamma + 360 + 1e-8) return false;
+        pause(false);
+        error = '';
+        const distance = target - gamma;
+        try {
+          if (distance > 1e-8) sim.advance('crank', distance, distance / rates.crank);
+        } catch (failure) {
+          error = failure.message;
+        }
+        emit();
+        return true;
+      }
       if (target < gamma - 1e-8) target += 360;
       if (target > gamma + 1e-8) {
         if (action?.control === 'seek') action.target = target;
@@ -1744,7 +1854,7 @@ function createOperationTransport(sim, scheduler = globalThis) {
       return true;
     },
     spool(degrees) {
-      if (controls284) return turnSpool(degrees > 0, Math.abs(degrees));
+      if (phaseControls) return turnSpool(degrees > 0, Math.abs(degrees));
       if (!sim.state.drive.engaged) start({ kind: 'spool', left: Math.abs(degrees), direction: Math.sign(degrees) });
     },
     turnSpool,
@@ -1754,35 +1864,38 @@ function createOperationTransport(sim, scheduler = globalThis) {
 }
 
 function mountOperationControls(root, transport, summary) {
-  const controls284 = transport.sim.controlsVersion === 284;
+  const directCrank = transport.sim.controlsVersion === 287;
+  const phaseControls = transport.sim.controlsVersion === 284 || directCrank;
+  const panelSelector = '[data-operation-panel="' + transport.sim.controlsVersion + '"]';
   const crankStep = transport.sim.passivePlate ? '0.1' : '1';
-  const crankButtons = controls284 ?
+  const crankButtons = phaseControls ?
     '<button data-operation="recover" type="button">摇臂复位离合</button>' :
     '<button data-operation="crank" type="button">逆时针一步</button>';
-  const crankSlider = controls284 ?
-    '<label data-operation-slider>摇臂角度 0–360° <input data-operation-size="crank" type="range" min="0" max="360" step="0.1" value="0"><output data-operation-angle="crank">0.0°</output></label><small>受止逆限制，回拖按正向跨圈到达。</small>' :
+  const crankSlider = phaseControls ?
+    '<label data-operation-slider>摇臂角度 0–360° <input data-operation-size="crank" type="range" min="0" max="360" step="0.1" value="0"><output data-operation-angle="crank">0.0°</output></label><small>' +
+      (directCrank ? '反拖停在实际角度。拖到 360° 后松手，从下一圈 0° 继续。' : '受止逆限制，回拖按正向跨圈到达。') + '</small>' :
     '<label data-operation-slider>摇臂步长 <input data-operation-size="crank" type="range" min="' + crankStep +
     '" max="180" step="' + crankStep + '" value="15"><output data-operation-angle="crank">15°</output></label>';
   root.innerHTML = [
-    '<section data-operation-panel="' + (controls284 ? '284' : '278') + '" aria-label="真实操作联动" style="display:grid;gap:8px">',
+    '<section data-operation-panel="' + (phaseControls ? transport.sim.controlsVersion : '278') + '" aria-label="真实操作联动" style="display:grid;gap:8px">',
     '<div><strong>按板</strong><div data-operation-actions><button data-operation="press" type="button">按板按下</button><button data-operation="lift" type="button">按板抬起</button></div></div>',
     '<div><strong>摇臂</strong><small> · 外侧看逆时针</small><div data-operation-actions>' + crankButtons +
       '<button data-operation="wind" type="button">连续摇臂</button></div>' + crankSlider + '</div>',
-    '<div><strong>线杯</strong>' + (controls284 ? '<small> · 正转为收线方向</small>' : '') +
+    '<div><strong>线杯</strong>' + (phaseControls ? '<small> · 正转为收线方向</small>' : '') +
       '<div data-operation-actions><button data-operation="spool-forward" type="button">线杯正转</button><button data-operation="spool-reverse" type="button">线杯反转</button></div>',
     '<label data-operation-slider>线杯步长 <input data-operation-size="spool" type="range" min="1" max="720" step="1" value="15"><output data-operation-angle="spool">15°</output></label></div>',
     '<div data-operation-actions><button data-operation="pause" type="button">暂停</button><button data-operation="reset" type="button">恢复初始状态</button></div>',
     '<output data-operation-state aria-live="polite"></output><output data-operation-detail></output>',
     '</section>',
-    controls284 ? '<style>' +
-      '[data-operation-panel="284"] button{background:#eef7fa;color:#15495a;border-color:#9db5bf}' +
-      '[data-operation-panel="284"] button:not(:disabled):is(:active,[data-active="true"]){background:#145568;color:#fff;border-color:#145568}' +
-      '[data-operation-panel="284"] button:disabled{background:#e5e7eb;color:#6b7280;border-color:#cbd2d8;opacity:1;cursor:default}' +
+    phaseControls ? '<style>' +
+      panelSelector + ' button{background:#eef7fa;color:#15495a;border-color:#9db5bf}' +
+      panelSelector + ' button:not(:disabled):is(:active,[data-active="true"]){background:#145568;color:#fff;border-color:#145568}' +
+      panelSelector + ' button:disabled{background:#e5e7eb;color:#6b7280;border-color:#cbd2d8;opacity:1;cursor:default}' +
       '</style>' : '',
   ].join('');
   const panel = root.firstElementChild;
   const document = root.ownerDocument, window = document.defaultView;
-  let dragPointer = null;
+  let dragPointer = null, dragTurn;
   const button = action => panel.querySelector('[data-operation="' + action + '"]');
   const input = kind => panel.querySelector('[data-operation-size="' + kind + '"]');
   const value = kind => Number(input(kind).value);
@@ -1791,35 +1904,36 @@ function mountOperationControls(root, transport, summary) {
   }
   for (const label of panel.querySelectorAll('[data-operation-slider]')) {
     label.style.cssText = 'display:grid;grid-template-columns:auto minmax(55px,1fr) ' +
-      (controls284 ? '4em' : '3em') + ';align-items:center;gap:6px';
+      (phaseControls ? '4em' : '3em') + ';align-items:center;gap:6px';
   }
   for (const action of panel.querySelectorAll('button')) {
     action.style.cssText = 'padding:3px 8px;border-width:1px;border-style:solid;border-radius:4px' +
-      (controls284 ? '' : ';border-color:currentColor');
+      (phaseControls ? '' : ';border-color:currentColor');
   }
   const actions = {
     press: () => transport.plate(true),
     lift: () => transport.plate(false),
-    ...(controls284 ? { recover: () => transport.recoverClutch() } : { crank: () => transport.crank(value('crank')) }),
+    ...(phaseControls ? { recover: () => transport.recoverClutch() } : { crank: () => transport.crank(value('crank')) }),
     wind: () => transport.crank(),
-    'spool-forward': () => controls284 ? transport.turnSpool(true, value('spool')) : transport.spool(value('spool')),
-    'spool-reverse': () => controls284 ? transport.turnSpool(false, value('spool')) : transport.spool(-value('spool')),
+    'spool-forward': () => phaseControls ? transport.turnSpool(true, value('spool')) : transport.spool(value('spool')),
+    'spool-reverse': () => phaseControls ? transport.turnSpool(false, value('spool')) : transport.spool(-value('spool')),
     pause: () => transport.pause(),
     reset: () => transport.reset(),
   };
   for (const [id, run] of Object.entries(actions)) button(id).onclick = run;
-  for (const kind of controls284 ? ['spool'] : ['crank', 'spool']) input(kind).oninput = () => {
+  for (const kind of phaseControls ? ['spool'] : ['crank', 'spool']) input(kind).oninput = () => {
     panel.querySelector('[data-operation-angle="' + kind + '"]').textContent = value(kind) + '°';
   };
   const stateLine = panel.querySelector('[data-operation-state]'), detail = panel.querySelector('[data-operation-detail]');
   const refresh = () => {
     const state = summary(transport.sim), { clutch, drive } = transport.sim.state;
     button('pause').disabled = !transport.action;
-    if (controls284) {
+    if (phaseControls) {
       button('recover').disabled = transport.sim.clutchIsReset();
       button('spool-reverse').disabled = !transport.sim.canReverseSpool();
-      const phase = state.phase > 360 - 1e-8 ? 0 : state.phase;
-      if (dragPointer === null) input('crank').value = String(phase);
+      const turnEnd = directCrank && dragTurn !== undefined && clutch.gamma >= dragTurn + 360 - 1e-8;
+      const phase = turnEnd ? 360 : state.phase > 360 - 1e-8 ? 0 : state.phase;
+      if (directCrank || dragPointer === null) input('crank').value = String(phase);
       panel.querySelector('[data-operation-angle="crank"]').textContent = phase.toFixed(1) + '°';
       const selected = transport.activeControl;
       const plateMoving = selected === 'press' || selected === 'lift';
@@ -1854,7 +1968,7 @@ function mountOperationControls(root, transport, summary) {
     panel.dataset.flip = String(state.flip);
     panel.dataset.yoke = String(state.yoke);
     panel.dataset.pinion = String(state.lift);
-    panel.dataset.engaged = String(Boolean(drive.engaged));
+    panel.dataset.engaged = String(Boolean(directCrank ? state.fullyEngaged : drive.engaged));
     panel.dataset.waiting = String(Boolean(drive.waiting));
     panel.dataset.dogContact = drive.dogContact || '';
     panel.dataset.awaitAxialThrust = String(Boolean(drive.awaitAxialThrust));
@@ -1864,18 +1978,20 @@ function mountOperationControls(root, transport, summary) {
   const finishDrag = event => {
     if (event.pointerId !== dragPointer) return;
     dragPointer = null;
+    dragTurn = undefined;
     if (event.type === 'pointercancel') transport.pause();
     else refresh();
   };
-  if (controls284) {
+  if (phaseControls) {
     const crankInput = input('crank');
     crankInput.onpointerdown = event => {
       dragPointer = event.pointerId;
+      if (directCrank) dragTurn = crankTurnStart(transport.sim.state.clutch.gamma);
       transport.pause();
     };
     crankInput.oninput = () => {
-      transport.seekCrankPhase(Number(crankInput.value));
-      refresh();
+      transport.seekCrankPhase(Number(crankInput.value), dragTurn);
+      if (!directCrank) refresh();
     };
     window.addEventListener('pointerup', finishDrag);
     window.addEventListener('pointercancel', finishDrag);
@@ -1885,13 +2001,14 @@ function mountOperationControls(root, transport, summary) {
     if (!document.hidden) return;
     const dragging = dragPointer !== null;
     dragPointer = null;
+    dragTurn = undefined;
     if (transport.action) transport.pause();
     else if (dragging) refresh();
   };
   document.addEventListener('visibilitychange', pauseWhenHidden);
   refresh();
   return () => {
-    if (controls284) {
+    if (phaseControls) {
       window.removeEventListener('pointerup', finishDrag);
       window.removeEventListener('pointercancel', finishDrag);
     }
@@ -2071,6 +2188,7 @@ function operationMesh278(data, sim) {
     throw error;
   }
   const redraw = () => { scene.queueShadowRender?.(); scene.queueRender(); };
+  let displayedPose;
   function resetMatrices() {
     for (const node of transforms.values()) {
       node.matrix.identity();
@@ -2079,6 +2197,8 @@ function operationMesh278(data, sim) {
   }
   return {
     draw(pose) {
+      if (pose === displayedPose) return;
+      displayedPose = pose;
       resetMatrices();
       for (const motion of pose.operations) {
         if (motion.kind === 'rotate') {
@@ -2098,7 +2218,12 @@ function operationMesh278(data, sim) {
       }
       redraw();
     },
-    suspend() { resetMatrices(); for (const meshes of springs.values()) meshes.forEach(mesh => mesh.restore()); redraw(); },
+    suspend() {
+      displayedPose = undefined;
+      resetMatrices();
+      for (const meshes of springs.values()) meshes.forEach(mesh => mesh.restore());
+      redraw();
+    },
     close() { resetMatrices(); for (const meshes of springs.values()) meshes.forEach(mesh => mesh.close()); },
   };
 }
@@ -2134,18 +2259,136 @@ function clearOperation278() {
   $('#operation278').hidden = true;
 }
 
+const downloadRetryStates = new Map();
+let catalogDigest;
+
+function activeLoadMode() {
+  return partsUI.isAssembly() ? 'assembly' : partsUI.isRevision() ? 'revision' : 'single';
+}
+
+function syncDownloadRetry() {
+  const button = $('#download-retry');
+  const state = downloadRetryStates.get(activeLoadMode());
+  button.hidden = !state;
+  button.disabled = state === 'loading';
+  button.textContent = button.disabled ? '重新下载中…' : '重新下载';
+}
+
+function setDownloadRetry(mode, state) {
+  if (state) downloadRetryStates.set(mode, state);
+  else downloadRetryStates.delete(mode);
+  syncDownloadRetry();
+}
+
+function clearDownloadRetry() {
+  downloadRetryStates.clear();
+  catalogDigest = undefined;
+  syncDownloadRetry();
+}
+
+function discardModelUrl(index) {
+  const url = cache.get(index);
+  if (url) URL.revokeObjectURL(url);
+  cache.delete(index);
+  plainCache.delete(index);
+}
+
+function matchingRevision(selected, next) {
+  const indices = next.ui.revisionModelIndices;
+  if (!selected) return indices[0];
+  const candidates = [
+    model => typeof selected.id === 'string' && model.id === selected.id,
+    model => model.plainSha256 === selected.plainSha256,
+    model => model.label === selected.label,
+  ];
+  for (const matches of candidates) {
+    const found = indices.filter(index => matches(next.models[index]));
+    if (found.length === 1) return found[0];
+  }
+  return indices[0];
+}
+
+async function refreshCatalogForRetry(isCurrent) {
+  const pkg = await getPackage(controller.signal);
+  if (!isCurrent()) return false;
+  if (pkg.manifest.catalog.sha256 === catalogDigest) return true;
+  const next = await readCatalog(key, pkg, controller.signal);
+  if (!isCurrent()) return false;
+
+  const previous = catalog;
+  const revisionSelect = $('#revision-select');
+  const chosen = matchingRevision(previous.models[Number(revisionSelect.value)], next);
+  const mainUnchanged = next.ui.mainModelIndex === mainIndex &&
+    previous.models[mainIndex].plainSha256 === next.models[mainIndex].plainSha256;
+  selection++;
+  revisionRequest++;
+  loadingIndex = revisionLoading = -1;
+  pendingModels.clear();
+  for (const index of cache.keys()) {
+    if (previous.models[index]?.plainSha256 !== next.models[index]?.plainSha256) discardModelUrl(index);
+  }
+  if (!mainUnchanged) {
+    active = -1;
+    delete document.documentElement.dataset.loaded;
+    viewer.removeAttribute('src');
+  }
+  if (revisionIndex !== chosen || revisionViewer.src !== cache.get(chosen)) {
+    revisionIndex = -1;
+    revisionViewer.removeAttribute('src');
+    delete revisionViewer.dataset.loaded;
+  }
+  catalog = next;
+  catalogDigest = pkg.manifest.catalog.sha256;
+  base = pkg.manifestUrl;
+  mainIndex = next.ui.mainModelIndex;
+  $('#title').textContent = next.title;
+  $('#note').textContent = next.note;
+  revisionSelect.replaceChildren(...next.ui.revisionModelIndices.map(index =>
+    new Option(next.models[index].label, String(index))));
+  if (chosen !== undefined) revisionSelect.value = String(chosen);
+  $('#mode-revision').disabled = !next.ui.revisionModelIndices.length;
+  return true;
+}
+
+async function retryCurrentDownload() {
+  const mode = activeLoadMode();
+  const failure = downloadRetryStates.get(mode);
+  if (!failure || failure === 'loading' || !catalog) return;
+  const run = epoch, request = mode === 'revision' ? revisionRequest : selection;
+  const isCurrent = () => run === epoch && activeLoadMode() === mode &&
+    request === (mode === 'revision' ? revisionRequest : selection);
+  setDownloadRetry(mode, 'loading');
+  try {
+    if (failure.httpStatus === 404 && !await refreshCatalogForRetry(isCurrent)) {
+      if (run === epoch && downloadRetryStates.get(mode) === 'loading') setDownloadRetry(mode, failure);
+      return;
+    }
+    if (mode === 'assembly') await selectModel(mainIndex, true);
+    else if (mode === 'single') partsUI.retrySingle();
+    else {
+      const index = Number($('#revision-select').value);
+      if (!catalog.ui.revisionModelIndices.includes(index)) throw Error('当前清单没有可加载的修订模型');
+      await selectRevision(index, true);
+    }
+  } catch (error) {
+    if (run !== epoch) return;
+    setDownloadRetry(mode, failure);
+    if (activeLoadMode() === mode) tell(error.message, true);
+  }
+}
+
 const $=s=>document.querySelector(s),status=$('#status'),viewer=$('#viewer'),revisionViewer=$('#revision-viewer');
 let key=null,catalog=null,base=null,epoch=0,selection=0,active=-1,controller=null;
 const cache=new Map(),plainCache=new Map(),pendingModels=new Map(),encoder=new TextEncoder();
 let mainIndex=-1,revisionIndex=-1,revisionRequest=0,revisionLoading=-1;
 let motionFrame=0,motionConfig=null,loadingIndex=-1,motionSequence=0,mechanismSequence=0,mechanismIndex=0;
 const pageIdentity=new URL('.',location.href).href,lockFlag='cad-preview-locked:'+pageIdentity;
-const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),revisionViewer,stopMotion,tell,onModeChange:mode=>{
+const partsUI=createPartsController({viewer,partViewer:$('#part-viewer'),revisionViewer,stopMotion,tell,onSingleRetry:state=>setDownloadRetry('single',state),onModeChange:mode=>{
   if(!catalog)return;
   if(mode!=='assembly')pauseOperation278();
   if(mode==='revision')selectRevision(Number($('#revision-select').value));
   else if(mode==='assembly'&&document.documentElement.dataset.loaded!==String(mainIndex))selectModel(mainIndex);
-  updateMotionUI();
+  updateMotionUI();syncDownloadRetry();
 }});
 const travelSeconds=()=>Number($('#motion-duration').value)||1;
 function clampMotionTime(time, duration) {
@@ -2351,9 +2594,13 @@ function urlAt(value,parent){
   return u;
 }
 function hex(buffer){return [...new Uint8Array(buffer)].map(x=>x.toString(16).padStart(2,'0')).join('');}
-async function bytes(url,limit,signal,progress){
-  const r=await fetch(url,{signal,credentials:'omit',referrerPolicy:'no-referrer',cache:url.pathname.endsWith('.enc')?'force-cache':'no-store'});
-  if(!r.ok)throw Error('下载失败（HTTP '+r.status+'），请稍后重试');
+async function bytes(url,limit,signal,progress,reload=false){
+  const r=await fetch(url,{signal,credentials:'omit',referrerPolicy:'no-referrer',cache:reload?'reload':url.pathname.endsWith('.enc')?'force-cache':'no-store'});
+  if(!r.ok){
+    const error=Error('下载失败（HTTP '+r.status+'），请稍后重试');
+    error.httpStatus=r.status;
+    throw error;
+  }
   if(!r.body){const b=await r.arrayBuffer();assert(b.byteLength<=limit);return b;}
   const reader=r.body.getReader(),parts=[];let size=0;
   while(true){const {value,done}=await reader.read();if(done)break;size+=value.length;if(size>limit){await reader.cancel();throw Error('预览包超过本页大小限制');}parts.push(value);progress?.(size);}
@@ -2361,12 +2608,22 @@ async function bytes(url,limit,signal,progress){
 }
 async function json(url,limit,signal){return JSON.parse(new TextDecoder().decode(await bytes(url,limit,signal)));}
 function descriptor(d){assert(d&&/^data\/[a-f0-9]{64}\.enc$/.test(d.path)&&/^[a-f0-9]{64}$/.test(d.sha256)&&d.path==='data/'+d.sha256+'.enc'&&Number.isSafeInteger(d.bytes)&&d.bytes>=32&&d.bytes<=64*1024*1024+32);}
+const failedEncryptedResources=new Set();
 async function decrypt(d,aad,k,parent,signal,progress){
-  descriptor(d);const b=await bytes(urlAt(d.path,parent),d.bytes,signal,progress);assert(b.byteLength===d.bytes&&hex(await crypto.subtle.digest('SHA-256',b))===d.sha256);
+  descriptor(d);
+  let b;
+  try{
+    b=await bytes(urlAt(d.path,parent),d.bytes,signal,progress,failedEncryptedResources.has(d.sha256));
+    assert(b.byteLength===d.bytes&&hex(await crypto.subtle.digest('SHA-256',b))===d.sha256);
+  }catch(error){
+    if(!signal?.aborted)failedEncryptedResources.add(d.sha256);
+    throw error;
+  }
+  failedEncryptedResources.delete(d.sha256);
   const a=new Uint8Array(b);assert(new TextDecoder().decode(a.slice(0,4))==='RPV1');
   return crypto.subtle.decrypt({name:'AES-GCM',iv:a.slice(4,16),additionalData:encoder.encode(aad),tagLength:128},k,a.slice(16));
 }
-let viewerReady;
+let viewerReady,viewerImportAttempts=0;
 const assetCache=new Map();
 async function segmentedGlb(entry,k,parent,signal,progress){
   let received=0;
@@ -2378,20 +2635,33 @@ async function segmentedGlb(entry,k,parent,signal,progress){
     assetCache.set(d.sha256,data);received+=d.bytes;progress?.(received);return data;
   }
   const layout=await asset(entry.layout),segments=new Array(entry.segments.length);let cursor=0;
-  await Promise.all(Array.from({length:Math.min(4,entry.segments.length)},async()=>{while(cursor<entry.segments.length){const i=cursor++;segments[i]=await asset(entry.segments[i]);}}));
+  const workers=Array.from({length:Math.min(4,entry.segments.length)},async()=>{
+    while(cursor<entry.segments.length){const i=cursor++;segments[i]=await asset(entry.segments[i]);}
+  });
+  const results=await Promise.allSettled(workers);
+  const rejected=results.filter(item=>item.status==='rejected');
+  if(rejected.length)throw (rejected.find(item=>item.reason?.httpStatus===404)||rejected[0]).reason;
   assert(!signal.aborted);const size=segments.reduce((n,b)=>n+b.byteLength,0),out=new Uint8Array(28+layout.byteLength+size),h=new DataView(out.buffer);
   h.setUint32(0,0x46546c67,true);h.setUint32(4,2,true);h.setUint32(8,out.length,true);h.setUint32(12,layout.byteLength,true);h.setUint32(16,0x4e4f534a,true);out.set(new Uint8Array(layout),20);
   h.setUint32(20+layout.byteLength,size,true);h.setUint32(24+layout.byteLength,0x004e4942,true);let offset=28+layout.byteLength;
   for(const b of segments){out.set(new Uint8Array(b),offset);offset+=b.byteLength;}return out.buffer;
 }
 function prepareViewer(){
-  if(!viewerReady){window.ModelViewerElement={meshoptDecoderLocation:new URL('./meshopt_decoder.js',import.meta.url).href};viewerReady=import('./model-viewer.min.js').then(()=>customElements.whenDefined('model-viewer'));}
+  if(!viewerReady){
+    window.ModelViewerElement={meshoptDecoderLocation:new URL('./meshopt_decoder.js',import.meta.url).href};
+    const moduleUrl=new URL('./model-viewer.min.js',import.meta.url);
+    if(viewerImportAttempts++)moduleUrl.searchParams.set('retry',String(viewerImportAttempts));
+    viewerReady=import(moduleUrl.href).then(()=>customElements.whenDefined('model-viewer')).catch(error=>{
+      viewerReady=undefined;
+      throw error;
+    });
+  }
   return viewerReady;
 }
 function clearState(){
   clearOperation278();clearSequence270();stopMotion();partsUI.reset(true);plainCache.clear();assetCache.clear();pendingModels.clear();$('#motion').hidden=true;
   epoch++;selection++;controller?.abort();controller=null;key=null;catalog=null;base=null;active=-1;loadingIndex=-1;motionConfig=null;
-  mainIndex=-1;revisionIndex=-1;revisionLoading=-1;revisionRequest++;revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-select').replaceChildren();$('#revision-retry').hidden=true;
+  mainIndex=-1;revisionIndex=-1;revisionLoading=-1;revisionRequest++;revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-select').replaceChildren();clearDownloadRetry();
   viewer.removeAttribute('src');for(const url of cache.values())URL.revokeObjectURL(url);cache.clear();
   $('#preview').hidden=true;$('#gate').hidden=false;$('#access-key').value='';$('#title').textContent='模型预览';$('#note').textContent='输入单独收到的访问密钥，解锁本次预览。';
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
@@ -2399,24 +2669,25 @@ function clearState(){
 async function modelUrl(index,run,progress){
   if(cache.has(index))return cache.get(index);
   if(pendingModels.has(index))return pendingModels.get(index);
-  const entry=catalog.models[index],k=key,parent=base,signal=controller.signal;
+  const modelCatalog=catalog,entry=modelCatalog.models[index],k=key,parent=base,signal=controller.signal;
   const task=(async()=>{
     const data=entry.transport==='segmented-glb-v2'?await segmentedGlb(entry,k,parent,signal,progress):await decrypt(entry,entry.aad,k,parent,signal,progress);
     assert(data.byteLength===entry.plainBytes&&hex(await crypto.subtle.digest('SHA-256',data))===entry.plainSha256);
     assert(new DataView(data).getUint32(0,true)===0x46546c67);
-    if(run!==epoch)return null;
+    if(run!==epoch||catalog!==modelCatalog)return null;
     plainCache.set(index,data);const url=URL.createObjectURL(new Blob([data],{type:'model/gltf-binary'}));cache.set(index,url);return url;
   })();
   pendingModels.set(index,task);
   try{return await task;}finally{if(pendingModels.get(index)===task)pendingModels.delete(index);}
 }
-async function selectRevision(index){
+async function selectRevision(index,retry=false){
   if(!catalog?.ui.revisionModelIndices.includes(index))return;
   const entry=catalog.models[index];
   if(index===revisionLoading){if(partsUI.isRevision())tell('正在加载'+entry.label+'…');return;}
+  if(retry)discardModelUrl(index);
   if(index===revisionIndex&&revisionViewer.loaded&&revisionViewer.src===cache.get(index)){if(partsUI.isRevision())tell(entry.label+'已加载，可旋转查看');return;}
   const run=epoch,request=++revisionRequest;revisionIndex=index;revisionLoading=index;
-  revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;$('#revision-retry').hidden=true;
+  revisionViewer.removeAttribute('src');delete revisionViewer.dataset.loaded;setDownloadRetry('revision',retry?'loading':null);
   const report=message=>{if(run===epoch&&request===revisionRequest&&partsUI.isRevision())tell(message);};
   report('正在加载'+entry.label+'…');
   try{
@@ -2425,15 +2696,16 @@ async function selectRevision(index){
     if(run!==epoch||request!==revisionRequest)return;
     revisionViewer.cameraOrbit='35deg 65deg auto';revisionViewer.cameraTarget='auto auto auto';revisionViewer.alt=entry.label;revisionViewer.src=url;
     report('解密完成，正在显示'+entry.label+'…');
-  }catch(e){if(run===epoch&&request===revisionRequest){revisionLoading=-1;$('#revision-retry').hidden=false;if(partsUI.isRevision())tell(e.name==='OperationError'?'修订模型解密失败，文件可能已损坏':e.message,true);}}
+  }catch(e){if(run===epoch&&request===revisionRequest){revisionLoading=-1;setDownloadRetry('revision',{httpStatus:e.httpStatus});if(partsUI.isRevision())tell(e.name==='OperationError'?'修订模型解密失败，文件可能已损坏':e.message,true);}}
 }
-async function selectModel(index){
+async function selectModel(index,retry=false){
   if(index===loadingIndex)return;
+  if(retry)discardModelUrl(index);
   if(index===active&&document.documentElement.dataset.loaded===String(index)&&viewer.src===cache.get(index)){
     $('#motion').hidden=!partsUI.isAssembly()||!(viewer.availableAnimations?.length);if(partsUI.isAssembly())tell(catalog.models[index].label+'已加载，可旋转查看');return;
   }
   const run=epoch,request=++selection,entry=catalog.models[index];active=index;
-  loadingIndex=index;
+  loadingIndex=index;setDownloadRetry('assembly',retry?'loading':null);
   stopMotion();partsUI.reset();$('#motion').hidden=true;viewer.removeAttribute('src');
   delete document.documentElement.dataset.loaded;delete document.documentElement.dataset.error;
   if(partsUI.isAssembly())tell('正在加载'+entry.label+'…');
@@ -2441,15 +2713,15 @@ async function selectModel(index){
     await prepareViewer();await viewer.updateComplete;if(run!==epoch||request!==selection)return;
     const objectUrl=await modelUrl(index,run,n=>{if(run===epoch&&request===selection&&partsUI.isAssembly())tell('正在下载'+entry.label+'：'+(n/1048576).toFixed(2)+' MB');});
     if(run!==epoch||request!==selection)return;if(partsUI.isAssembly())tell('解密完成，正在显示'+entry.label+'…');viewer.src=objectUrl;
-  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;tell(e.name==='OperationError'?'模型解密失败，文件可能已损坏或密钥不匹配':e.message,true);document.documentElement.dataset.error='true';}}
+  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;setDownloadRetry('assembly',{httpStatus:e.httpStatus});if(partsUI.isAssembly())tell(e.name==='OperationError'?'模型解密失败，文件可能已损坏或密钥不匹配':e.message,true);document.documentElement.dataset.error='true';}}
 }
-async function getPackage(){
-    const source=await json(new URL('./source.json',location.href),4096),manifestUrl=urlAt(source.manifest,location.href);
-    const manifest=await json(manifestUrl,16384);assert(manifest.version===1&&/^[a-f0-9]{32}$/.test(manifest.packageId));
+async function getPackage(signal){
+    const source=await json(new URL('./source.json',location.href),4096,signal),manifestUrl=urlAt(source.manifest,location.href);
+    const manifest=await json(manifestUrl,16384,signal);assert(manifest.version===1&&/^[a-f0-9]{32}$/.test(manifest.packageId));
     return {manifest,manifestUrl,scope:manifestUrl.href+'#'+manifest.packageId};
 }
-async function openPackage(candidate,pkg,run,save){
-    const {manifest,manifestUrl}=pkg,signal=controller.signal;
+async function readCatalog(candidate,pkg,signal){
+    const {manifest,manifestUrl}=pkg;
     const plain=await decrypt(manifest.catalog,'rp1:'+manifest.packageId+':catalog',candidate,manifestUrl,signal);
     const unlocked=JSON.parse(new TextDecoder().decode(plain));
     assert(unlocked.version===1&&unlocked.packageId===manifest.packageId&&typeof unlocked.title==='string'&&typeof unlocked.note==='string'&&Array.isArray(unlocked.models)&&unlocked.models.length>0&&unlocked.models.length<=20);
@@ -2464,7 +2736,14 @@ async function openPackage(candidate,pkg,run,save){
     const ui=unlocked.ui,indices=ui?.revisionModelIndices;
     assert(Number.isInteger(ui?.mainModelIndex)&&ui.mainModelIndex>=0&&ui.mainModelIndex<unlocked.models.length&&Array.isArray(indices)&&new Set(indices).size===indices.length&&indices.every(i=>Number.isInteger(i)&&i>=0&&i<unlocked.models.length&&i!==ui.mainModelIndex));
     assert(indices.length+1===unlocked.models.length);
-    if(run!==epoch)return;key=candidate;catalog=unlocked;base=manifestUrl;mainIndex=ui.mainModelIndex;
+    return unlocked;
+}
+async function openPackage(candidate,pkg,run,save){
+    const unlocked=await readCatalog(candidate,pkg,controller.signal);
+    if(run!==epoch)return;
+    const ui=unlocked.ui,indices=ui.revisionModelIndices;
+    key=candidate;catalog=unlocked;base=pkg.manifestUrl;mainIndex=ui.mainModelIndex;
+    catalogDigest=pkg.manifest.catalog.sha256;
     $('#title').textContent=catalog.title;$('#note').textContent=catalog.note;
     for(const i of indices){const option=document.createElement('option');option.value=String(i);option.textContent=catalog.models[i].label;$('#revision-select').append(option);}
     $('#mode-revision').disabled=!indices.length;$('#view-modes').hidden=false;
@@ -2495,19 +2774,30 @@ $('#motion-forward').addEventListener('click', () => playMotion('rotation', 1));
 $('#motion-reverse').addEventListener('click', () => playMotion('rotation', -1));
 $('#motion-pause').addEventListener('click', stopMotion);
 $('#revision-select').addEventListener('change',()=>selectRevision(Number($('#revision-select').value)));
-$('#revision-retry').addEventListener('click',()=>selectRevision(Number($('#revision-select').value)));
-revisionViewer.addEventListener('load',()=>{if(catalog&&cache.get(revisionIndex)===revisionViewer.src){revisionLoading=-1;revisionViewer.dataset.loaded=String(revisionIndex);if(partsUI.isRevision())tell(catalog.models[revisionIndex].label+'已加载，可旋转查看');}});
-revisionViewer.addEventListener('error',()=>{if(catalog){revisionLoading=-1;$('#revision-retry').hidden=false;if(partsUI.isRevision())tell('修订模型显示失败，请重新加载',true);}});
+$('#download-retry').addEventListener('click',retryCurrentDownload);
+revisionViewer.addEventListener('load',()=>{if(catalog&&cache.get(revisionIndex)===revisionViewer.src){revisionLoading=-1;setDownloadRetry('revision',null);revisionViewer.dataset.loaded=String(revisionIndex);if(partsUI.isRevision())tell(catalog.models[revisionIndex].label+'已加载，可旋转查看');}});
+revisionViewer.addEventListener('error',()=>{
+  if(!catalog||!revisionViewer.src||cache.get(revisionIndex)!==revisionViewer.src)return;
+  revisionLoading=-1;discardModelUrl(revisionIndex);
+  revisionViewer.removeAttribute('src');
+  setDownloadRetry('revision',{});
+  if(partsUI.isRevision())tell('修订模型显示失败，请重新下载',true);
+});
 viewer.addEventListener('load',async()=>{
   const run=epoch,request=selection;if(!catalog||cache.get(active)!==viewer.src)return;
   try{
     setupSequence270();await configureMotion();if(run!==epoch||request!==selection||!catalog)return;
     await partsUI.configure(catalog.models[active],plainCache.get(active));if(run!==epoch||request!==selection||!catalog)return;
     await selectMechanism(0);if(run!==epoch||request!==selection||!catalog)return;
-    loadingIndex=-1;if(partsUI.isAssembly())tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);
-  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;document.documentElement.dataset.error='true';if(partsUI.isAssembly())tell('装配显示初始化失败：'+e.message,true);}}
+    loadingIndex=-1;setDownloadRetry('assembly',null);if(partsUI.isAssembly())tell(catalog.models[active].label+'已加载，可旋转查看');document.documentElement.dataset.loaded=String(active);
+  }catch(e){if(run===epoch&&request===selection){loadingIndex=-1;discardModelUrl(active);viewer.removeAttribute('src');setDownloadRetry('assembly',{});document.documentElement.dataset.error='true';if(partsUI.isAssembly())tell('装配显示初始化失败：'+e.message,true);}}
 });
-viewer.addEventListener('error',()=>{if(catalog){loadingIndex=-1;if(partsUI.isAssembly())tell('装配体显示失败，点击“装配体”可重试',true);document.documentElement.dataset.error='true';}});
+viewer.addEventListener('error',()=>{
+  if(!catalog||!viewer.src||cache.get(active)!==viewer.src)return;
+  loadingIndex=-1;discardModelUrl(active);viewer.removeAttribute('src');
+  setDownloadRetry('assembly',{});document.documentElement.dataset.error='true';
+  if(partsUI.isAssembly())tell('装配体显示失败，请重新下载',true);
+});
 window.addEventListener('pagehide',clearState);
 async function restoreDevice(){
   $('#unlock').disabled=true;

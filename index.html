@@ -22,10 +22,10 @@
 <p class="hint">密码只在浏览器内用于解密，不随下载请求发送。请仅在自己的设备上勾选记住。</p>
 </section>
 <section id="preview" hidden aria-label="模型查看器">
-<nav aria-label="预览操作"><div><button id="reset" type="button">恢复视角</button><button id="lock" type="button">锁定预览</button></div></nav>
+<nav aria-label="预览操作"><div><button id="reset" type="button">恢复视角</button><button id="lock" type="button">锁定预览</button><button id="download-retry" type="button" hidden>重新下载</button></div></nav>
 <div id="view-modes" class="view-modes" role="group" aria-label="查看方式" hidden><button id="mode-assembly" type="button" class="active" aria-pressed="true">装配体</button><button id="mode-single" type="button" aria-pressed="false" disabled>独立零件</button><button id="mode-revision" type="button" aria-pressed="false">修订缓存预览</button></div>
 <div id="part-picker" hidden><label for="part-select">选择零件</label><select id="part-select"></select></div>
-<div id="revision-picker" hidden><label for="revision-select">选择临时零件 / 版本</label><select id="revision-select"></select><p class="hint">仅供修订对照，不替换装配体中的正式零件。</p><button id="revision-retry" type="button" hidden>重新加载</button></div>
+<div id="revision-picker" hidden><label for="revision-select">选择临时零件 / 版本</label><select id="revision-select"></select><p class="hint">仅供修订对照，不替换装配体中的正式零件。</p></div>
 <model-viewer id="viewer" camera-controls zoom-sensitivity="0.25" touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="三维模型预览"></model-viewer>
 <model-viewer id="part-viewer" camera-controls zoom-sensitivity="0.25" touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="独立零件预览" hidden></model-viewer>
 <model-viewer id="revision-viewer" camera-controls zoom-sensitivity="0.25" touch-action="pan-y" shadow-intensity="0" exposure="1" camera-orbit="35deg 65deg auto" min-camera-orbit="auto auto 5%" max-camera-orbit="auto auto 500%" interaction-prompt="none" loading="eager" alt="修订缓存预览" hidden></model-viewer>
