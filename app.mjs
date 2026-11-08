@@ -223,20 +223,20 @@ return { springCenterline };
 const opTorsion284 = (() => {
 
 // The wire is modeled in its nominal installed shape. The anchor force model is planar.
-const spring290Axial = Object.freeze({
+const spring292Axial = Object.freeze({
   nylonTopOldZ: 28.437524023444834,
   wireRadiusMm: .175,
-  pitchMm: .42,
+  pitchMm: 0.4647988520290663,
   pitchLeadTurns: .10,
   bendRadiusMm: .40,
   primaryInsideAngleDeg: 80,
   fixedFootTipOldZ: 26.137524023444834,
-  movingEarBottomOldZ: 27.95,
-  movingEarTopOldZ: 29.45,
+  movingEarBottomOldZ: 27.85,
+  movingEarTopOldZ: 29.75,
   movingExposureBeforeBendMm: .40,
   retentionBendRadiusMm: .40,
   retentionTailMm: .30,
-  retentionTurnDeg: 20,
+  retentionTurnDeg: 14,
 });
 
 const TAU = 2 * Math.PI;
@@ -255,7 +255,7 @@ function pitchRun(turn, total, ramp) {
 }
 
 function bentLead(base, outward, arm, z, direction, holeMidZ) {
-  const { bendRadiusMm: radius, primaryInsideAngleDeg: inside } = spring290Axial;
+  const { bendRadiusMm: radius, primaryInsideAngleDeg: inside } = spring292Axial;
   const sweep = (180 - inside) * RAD;
   const tilt = (90 - inside) * RAD;
   const reach = axial => arm - direction * Math.tan(tilt) * (axial - holeMidZ);
@@ -269,11 +269,11 @@ function bentLead(base, outward, arm, z, direction, holeMidZ) {
   return { curve, point, reach, tilt };
 }
 
-function springSegments290(row, oldToWorld, retentionTurnDeg = spring290Axial.retentionTurnDeg) {
+function springSegments292(row, oldToWorld, retentionTurnDeg = spring292Axial.retentionTurnDeg) {
   const { R, N, alpha_deg: alphaDeg, angle, coil_xy_old_mm: coil } = row.spring;
   const { nylonTopOldZ, wireRadiusMm, pitchMm, pitchLeadTurns, fixedFootTipOldZ,
     movingEarBottomOldZ, movingEarTopOldZ, movingExposureBeforeBendMm,
-    retentionBendRadiusMm, retentionTailMm } = spring290Axial;
+    retentionBendRadiusMm, retentionTailMm } = spring292Axial;
   const half = alphaDeg * RAD / 2;
   const sine = Math.sin(half), cosine = Math.cos(half);
   const start = [-R * cosine, -R * sine], end = [R * cosine, -R * sine];
@@ -324,12 +324,13 @@ function springSegments290(row, oldToWorld, retentionTurnDeg = spring290Axial.re
   }));
 }
 
-function springCenterline290(row, oldToWorld) {
-  return springSegments290(row, oldToWorld).flatMap(({ points }, index) => index ? points.slice(1) : points);
+function springCenterline292(row, oldToWorld) {
+  return springSegments292(row, oldToWorld).flatMap(({ points }, index) => index ? points.slice(1) : points);
 }
 
 
-return { springCenterline290, spring290Axial };
+
+return { springCenterline292, spring292Axial };
 })();
 
 const opState = (() => {
