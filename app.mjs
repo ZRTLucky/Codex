@@ -1,5 +1,5 @@
-import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs';
-import {createPartsController} from './parts-controller.mjs';
+import {importAccessKey,rememberedKey,rememberKey,forgetPageKeys} from './device-auth.mjs?v=110433cdb231a583dc72';
+import {createPartsController} from './parts-controller.mjs?v=612ce22472fdf2a01f43';
 // Shared by the generated STEP module, web controls and GLB animation compiler.
 // Absolute world transforms: rotate about the CAD datum, then translate.
 function createSequencePlayer(data) {
@@ -2260,6 +2260,9 @@ function operationMesh278(data, sim) {
 function setupOperation278(data) {
   clearOperation278();
   if (!data) return;
+  if (data.torsionSpring && typeof opTorsion284?.['springCenterline' + data.torsionSpring] !== 'function') {
+    throw Error('模型与联动程序版本不一致，请点“重新下载”刷新联动程序');
+  }
   const sim = opState.createOperationState(data, opContact.makeClutchContact(data.contact), opCoupling, opTorsion284);
   const transport = opControls.createOperationTransport(sim);
   const mesh = operationMesh278(data, sim);
@@ -2388,6 +2391,20 @@ async function retryCurrentDownload() {
     request === (mode === 'revision' ? revisionRequest : selection);
   setDownloadRetry(mode, 'loading');
   try {
+    // Retry may follow a deployment while this tab still has the old controller.
+    // Refresh the program first; repeatedly downloading the new model cannot fix it.
+    const response = await fetch(new URL('./index.html', import.meta.url), { cache: 'no-store' });
+    if (response.ok) {
+      const next = (await response.text()).match(/src="\.\/app\.mjs\?v=([a-f0-9]+)"/)?.[1];
+      const current = new URL(import.meta.url).searchParams.get('v');
+      if (next && next !== current) {
+        tell('联动程序已更新，正在刷新页面…');
+        const url = new URL(location.href);
+        url.searchParams.set('runtime', next);
+        location.replace(url.href);
+        return;
+      }
+    }
     if (failure.httpStatus === 404 && !await refreshCatalogForRetry(isCurrent)) {
       if (run === epoch && downloadRetryStates.get(mode) === 'loading') setDownloadRetry(mode, failure);
       return;
